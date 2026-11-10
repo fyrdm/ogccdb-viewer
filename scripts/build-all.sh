@@ -13,9 +13,9 @@ BUILD_DIR=build-release
 clone() {
     local name=$1
     [ -d "$PARENT/$name" ] && return
-    if command -v gh >/dev/null 2>&1; then
-        gh repo clone "fyrdm/$name" "$PARENT/$name"
-    else
+    # gh handles private repositories when it is signed in; plain git otherwise.
+    if ! { command -v gh >/dev/null 2>&1 && gh repo clone "fyrdm/$name" "$PARENT/$name"; }; then
+        rm -rf "${PARENT:?}/$name"
         git clone "https://github.com/fyrdm/$name.git" "$PARENT/$name"
     fi
 }
