@@ -45,6 +45,8 @@ struct Args {
     int mesh_resolution = 32;
     std::string sea = "auto";
     double sea_offset = 0.0;
+    std::optional<double> wave_height, wind_from;
+    int frames = 1;
 };
 
 void usage() {
@@ -63,8 +65,11 @@ void usage() {
         "  --sea <ref>                 sea surface: auto (best installed geoid, default),\n"
         "                              egm2008, egm96, ellipsoid or off\n"
         "  --sea-offset <m>            raise (or lower) the sea above its reference\n"
+        "  --waves <m>                 wave height, crest to trough (default 1.5; 0 = calm)\n"
+        "  --wind <deg>                direction the wind blows from (default 240)\n"
         "  --size <w>x<h>              window size (default 1600x1000)\n"
         "  --screenshot <file.png>     render until all tiles are loaded, save, exit\n"
+        "  --frames <n>                with --screenshot: save n frames at 30 fps as file_0000.png ...\n"
         "  --no-ui                     hide the panels\n"
         "  --no-skirts                 draw tiles without skirts (shows cracks)\n"
         "  --mesh-resolution <n>       grid cells per tile side (default 32)\n"
@@ -112,6 +117,9 @@ std::optional<Args> parse(int argc, char** argv) {
                 return std::nullopt;
             }
         } else if (s == "--sea-offset") { const char* v = next(); if (!v) return std::nullopt; a.sea_offset = std::atof(v); }
+        else if (s == "--waves") { if (!number(a.wave_height)) return std::nullopt; }
+        else if (s == "--wind") { if (!number(a.wind_from)) return std::nullopt; }
+        else if (s == "--frames") { const char* v = next(); if (!v) return std::nullopt; a.frames = std::max(1, std::atoi(v)); }
         else if (s == "--size") {
             const char* v = next();
             if (!v || std::sscanf(v, "%dx%d", &a.width, &a.height) != 2) return std::nullopt;
@@ -378,6 +386,11 @@ void ui(Views& v, Terrain& terrain, Renderer& renderer, RenderSettings& settings
             ImGui::DragFloat("Sea offset", &sea.offset, 1.0f, -1000.0f, 9000.0f, "%+.0f m");
             ImGui::SameLine();
             if (ImGui::SmallButton("0")) sea.offset = 0.0f;
+            ImGui::Checkbox("Waves", &settings.waves);
+            if (settings.waves) {
+                ImGui::SliderFloat("Wave height", &settings.wave_height, 0.1f, 8.0f, "%.1f m", ImGuiSliderFlags_Logarithmic);
+                ImGui::SliderFloat("Wind from", &settings.wind_from, 0.0f, 360.0f, "%.0f deg");
+            }
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
             ImGui::TextWrapped("Use the geoid if the store holds ellipsoid heights, the ellipsoid if it holds "
                                "heights above sea level. Raise the offset to flood the terrain.");
@@ -497,6 +510,13 @@ int main(int argc, char** argv) {
         if (args.sea == "egm96") sea.reference = Sea::Egm96;
         if (args.sea == "ellipsoid") sea.reference = Sea::Ellipsoid;
         sea.offset = static_cast<float>(args.sea_offset);
+        if (args.wave_height) {
+            settings.wave_height = static_cast<float>(std::max(*args.wave_height, 0.0));
+            settings.waves = *args.wave_height > 0.0;
+        }
+        if (args.wind_from) settings.wind_from = static_cast<float>(*args.wind_from);
+        if (args.screenshot) renderer.set_clock(0.0);  // reproducible waves
+        int saved_frames = 0;
         if (settings.sea) {
             Geoid* g = sea.geoid();
             std::printf("sea: %s%s\n", sea.name(g),
@@ -716,9 +736,11 @@ int main(int argc, char** argv) {
                                                      : "Free fly - WASD move, E/Q up/down, G walk, Esc/Tab release mouse")
                                        : "Click the view or press Tab for mouse look";
                 const ImVec2 ts = ImGui::CalcTextSize(hint);
-                fg->AddRectFilled(ImVec2(c.x - ts.x * 0.5f - 8, 8), ImVec2(c.x + ts.x * 0.5f + 8, 16 + ts.y),
-                                  IM_COL32(0, 0, 0, 140), 4.0f);
-                fg->AddText(ImVec2(c.x - ts.x * 0.5f, 12), IM_COL32(255, 255, 255, 230), hint);
+                if (!(args.screenshot && args.hide_ui)) {  // clean frames for --screenshot --no-ui
+                    fg->AddRectFilled(ImVec2(c.x - ts.x * 0.5f - 8, 8), ImVec2(c.x + ts.x * 0.5f + 8, 16 + ts.y),
+                                      IM_COL32(0, 0, 0, 140), 4.0f);
+                    fg->AddText(ImVec2(c.x - ts.x * 0.5f, 12), IM_COL32(255, 255, 255, 230), hint);
+                }
                 if (views.mouse_captured) {  // crosshair
                     const ImU32 col = IM_COL32(255, 255, 255, 200);
                     fg->AddLine(ImVec2(c.x - 9, c.y), ImVec2(c.x - 3, c.y), col, 1.5f);
@@ -735,15 +757,25 @@ int main(int argc, char** argv) {
                 // Done once nothing is queued or loading and the view has stopped changing.
                 const TerrainStats s = terrain->stats();
                 stable_frames = (s.queued == 0 && s.loading == 0 && renderer.stats().uploads == 0) ? stable_frames + 1 : 0;
-                if (stable_frames >= 5 || frame > 3000) {
+                if (stable_frames >= 5 || frame > 3000 || saved_frames > 0) {
                     gl::Finish();
-                    if (!save_screenshot(*args.screenshot, fb_w, fb_h)) {
-                        std::fprintf(stderr, "ogccdb-viewer: cannot write %s\n", args.screenshot->c_str());
-                        result = 1;
-                    } else {
-                        std::printf("saved %s after %d frames (%zu tiles)\n", args.screenshot->c_str(), frame, s.drawn);
+                    std::string file = *args.screenshot;
+                    if (args.frames > 1) {
+                        char num[16];
+                        std::snprintf(num, sizeof num, "_%04d", saved_frames);
+                        const std::filesystem::path p(file);
+                        file = (p.parent_path() / (p.stem().string() + num + p.extension().string())).string();
                     }
-                    break;
+                    if (!save_screenshot(file, fb_w, fb_h)) {
+                        std::fprintf(stderr, "ogccdb-viewer: cannot write %s\n", file.c_str());
+                        result = 1;
+                        break;
+                    }
+                    if (++saved_frames >= args.frames) {
+                        std::printf("saved %s after %d frames (%zu tiles)\n", file.c_str(), frame, s.drawn);
+                        break;
+                    }
+                    renderer.set_clock(saved_frames / 30.0);
                 }
                 if (s.queued || s.loading) terrain->wait_idle();
             }

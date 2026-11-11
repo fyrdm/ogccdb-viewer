@@ -1,7 +1,9 @@
 #pragma once
 // Draws the runtime's terrain tiles and a sea-level reference surface with OpenGL 3.3 core.
+#include <chrono>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -20,6 +22,11 @@ struct RenderSettings {
     bool sea = true;
     bool graticule = true;
     std::function<double(double lat, double lon)> sea_height;
+    /// Moving waves on the sea: wave height (crest to trough, metres) and the
+    /// direction the wind blows from (degrees clockwise from north).
+    bool waves = true;
+    float wave_height = 1.5f;
+    float wind_from = 240.0f;
     float exaggeration = 1.0f;
 };
 
@@ -41,6 +48,9 @@ public:
               int width, int height, const RenderSettings& settings);
 
     const RenderStats& stats() const { return stats_; }
+    /// Fix the wave clock at `seconds` (for reproducible screenshots and frame
+    /// sequences); by default it runs in real time.
+    void set_clock(double seconds) { fixed_time_ = seconds; }
 
 private:
     struct GpuTile {
@@ -56,7 +66,14 @@ private:
     void draw_surface(const ogccdb::runtime::Camera& camera, const RenderSettings& settings, const float sky[3],
                       double haze, ogccdb::runtime::Vec3d light);
 
+    void set_wave_anchor(double lat, double lon);
+    std::vector<float> wave_uniforms(const RenderSettings& settings) const;
+
     GLuint terrain_program_ = 0;
+    std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
+    std::optional<double> fixed_time_;
+    bool wave_anchor_set_ = false;
+    ogccdb::runtime::Vec3d wave_anchor_, wave_east_, wave_north_;
     GLuint surface_program_ = 0;
     GLuint surface_vao_ = 0, surface_vbo_ = 0, surface_ibo_ = 0;
     GLsizei surface_index_count_ = 0;

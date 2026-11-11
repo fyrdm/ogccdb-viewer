@@ -52,6 +52,7 @@
     X(PFNGLUNIFORM1FPROC, Uniform1f)                                   \
     X(PFNGLUNIFORM3FPROC, Uniform3f)                                   \
     X(PFNGLUNIFORM4FPROC, Uniform4f)                                   \
+    X(PFNGLUNIFORM4FVPROC, Uniform4fv)                                 \
     X(PFNGLGENTEXTURESPROC, GenTextures)                               \
     X(PFNGLBINDTEXTUREPROC, BindTexture)                               \
     X(PFNGLTEXIMAGE2DPROC, TexImage2D)                                 \

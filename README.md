@@ -70,6 +70,14 @@ build-release/ogccdb-viewer <cdb> --sea ellipsoid --sea-offset 430   # flood to 
 build-release/ogccdb-viewer <cdb> --sea off                          # dark background globe
 ```
 
+The sea moves: a wind sea of 24 travelling waves, from a dominant wave whose length grows
+with the wave height down to one-metre ripples, each moving at its deep-water speed
+(c = sqrt(g / k)). The longer waves lift the surface near the eye; all of them shade it,
+each fading out before it gets smaller than a pixel, with sun glitter and some foam on the
+crests of a rough sea. **Waves**, **Wave height** (crest to trough) and **Wind from** are in
+the panel; `--waves <m>` (0 = calm, default 1.5) and `--wind <deg>` set them at start.
+`--screenshot f.png --frames 150` saves 5 s of frames at 30 fps (`f_0000.png` ...) for a clip.
+
 `--sea` takes `auto` (default), `egm2008`, `egm96`, `ellipsoid` or `off`. The geoid comes
 from PROJ grids (`proj-data`, or `PROJ_NETWORK=ON`); without one the sea falls back to the
 ellipsoid and the panel says so.

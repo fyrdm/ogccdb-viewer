@@ -75,19 +75,40 @@ void main() {
 
 // Reference surface: vertices are already relative to the eye (computed in
 // double precision on the CPU), so it is exact near the ground too.
+// Waves: a sum of travelling sine waves on a local plane around the eye
+// (a_wave, metres east and north of an anchor). The longer ones lift the
+// vertices near the eye; all of them shape the normals, each fading out
+// where it would be smaller than a pixel.
 const char* kSurfaceVs = R"(#version 330 core
 layout(location = 0) in vec3 a_rel;
 layout(location = 1) in vec3 a_up;
 layout(location = 2) in vec2 a_latlon;
+layout(location = 3) in vec2 a_wave;
 uniform mat4 u_vp;
+uniform int u_wave_count;
+uniform int u_vertex_waves;
+uniform vec4 u_wave[24];  // wave number east, north (rad/m); amplitude (m); phase (rad)
 out vec3 v_rel;
 out vec3 v_up;
 out vec2 v_latlon;
+out vec2 v_wave;
 void main() {
-    gl_Position = u_vp * vec4(a_rel, 1.0);
-    v_rel = a_rel;
+    vec3 p = a_rel;
+    // Ring spacing is about a tenth of the distance: lift only by waves the mesh can hold.
+    float spacing = 0.11 * length(a_rel);
+    float h = 0.0;
+    for (int i = 0; i < u_vertex_waves && i < u_wave_count; ++i) {
+        float wavelength = 6.2831853 / length(u_wave[i].xy);
+        float w = 1.0 - smoothstep(0.08, 0.2, spacing / wavelength);
+        // exp(sin - 1): sharp crests, wide troughs, like real wind waves.
+        h += w * u_wave[i].z * (2.0 * exp(sin(dot(u_wave[i].xy, a_wave) - u_wave[i].w) - 1.0) - 1.0);
+    }
+    p += a_up * h;
+    gl_Position = u_vp * vec4(p, 1.0);
+    v_rel = p;
     v_up = a_up;
     v_latlon = a_latlon;
+    v_wave = a_wave;
 }
 )";
 
@@ -95,37 +116,68 @@ const char* kSurfaceFs = R"(#version 330 core
 in vec3 v_rel;
 in vec3 v_up;
 in vec2 v_latlon;
+in vec2 v_wave;
 uniform int u_sea;
 uniform int u_graticule;
 uniform vec3 u_light;
 uniform vec3 u_sky;
 uniform float u_haze_distance;
-uniform float u_time;
+uniform int u_wave_count;
+uniform vec4 u_wave[24];
+uniform vec3 u_east;
+uniform vec3 u_north;
+uniform float u_wave_height;
 out vec4 frag;
 float grid(vec2 coord, float spacing) {
     vec2 g = abs(fract(coord / spacing - 0.5) - 0.5) / fwidth(coord / spacing);
     return 1.0 - min(min(g.x, g.y), 1.0);
 }
 void main() {
-    vec3 n = normalize(v_up);
+    vec3 up = normalize(v_up);
     float dist = length(v_rel);
     vec3 c;
     if (u_sea != 0) {
-        // Small moving waves, fading with distance so they never alias.
-        vec3 e = normalize(cross(vec3(0.0, 0.0, 1.0), n) + vec3(1e-6, 0.0, 0.0));
-        vec3 nn = cross(n, e);
-        vec2 m = vec2(v_latlon.y * 111320.0 * cos(radians(v_latlon.x)), v_latlon.x * 110540.0);
-        float k1 = 6.2831 / 37.0, k2 = 6.2831 / 23.0;
-        float dx = 0.6 * cos(m.x * k1 + m.y * 0.3 * k1 + u_time * 1.3) + 0.4 * cos(m.x * 0.5 * k2 - m.y * k2 + u_time * 1.9);
-        float dy = 0.6 * cos(m.y * k1 - m.x * 0.2 * k1 + u_time * 1.1) + 0.4 * cos(m.y * 0.7 * k2 + m.x * k2 + u_time * 1.7);
-        float amp = 0.06 * exp(-dist / 4000.0);
-        vec3 w = normalize(n + (e * dx + nn * dy) * amp);
+        // Pixel footprint on the water, in metres (its longer side, so waves fade
+        // early at grazing angles instead of turning into streaks).
+        float footprint = max(length(dFdx(v_wave)), length(dFdy(v_wave)));
+        vec2 grad = vec2(0.0);
+        float h = 0.0, lost = 0.0, fine = 0.0;
+        for (int i = 0; i < u_wave_count; ++i) {
+            vec2 k = u_wave[i].xy;
+            float a = u_wave[i].z;
+            float ph = dot(k, v_wave) - u_wave[i].w;
+            // Phase change across one pixel: fade the wave before it aliases.
+            float w = 1.0 - smoothstep(0.3, 0.8, length(k) * footprint);
+            float e = exp(sin(ph) - 1.0);  // same wave shape as the vertex shader
+            grad += w * a * k * 2.0 * e * cos(ph);
+            h += w * a * (2.0 * e - 1.0);
+            if (i >= u_wave_count / 2) fine += w * sin(ph);  // small waves: break up the foam
+            float sl = (1.0 - w) * a * length(k);  // slope too fine to see: roughness
+            lost += sl * sl;
+        }
+        float rough = smoothstep(0.0, 0.35, sqrt(lost));  // RMS of the slopes faded out
+        // Far away the visible waves are few: soften them with the lost detail.
+        vec3 n = normalize(up - (u_east * grad.x + u_north * grad.y) * (1.0 - 0.6 * rough));
         vec3 view = normalize(-v_rel);
-        float fres = 0.04 + 0.96 * pow(1.0 - max(dot(w, view), 0.0), 5.0);
-        vec3 deep = vec3(0.03, 0.12, 0.20);
-        c = mix(deep, u_sky * 0.95, clamp(fres, 0.0, 1.0));
-        vec3 h = normalize(u_light + view);
-        c += vec3(1.0, 0.97, 0.9) * pow(max(dot(w, h), 0.0), 180.0) * 0.6;
+        if (dot(n, view) < 0.02) n = normalize(n + view * (0.02 - dot(n, view)));
+        float fres = 0.02 + 0.98 * pow(1.0 - max(dot(n, view), 0.0), 5.0);
+        vec3 deep = vec3(0.02, 0.10, 0.17);
+        float crest = u_wave_height > 1e-3 ? clamp(h / (0.5 * u_wave_height), -1.5, 1.5) : 0.0;
+        deep += vec3(0.0, 0.035, 0.035) * clamp(crest, 0.0, 1.0);  // light through the crests
+        // Reflected sky: bright at the horizon, deeper blue overhead, so each
+        // wave facet reflects a different part of it.
+        vec3 r = reflect(-view, n);
+        float ru = dot(r, up);
+        vec3 zenith = vec3(0.22, 0.40, 0.70);
+        vec3 reflected = ru > 0.0 ? mix(u_sky, zenith, pow(ru, 0.6)) : u_sky * 0.8;
+        c = mix(deep, reflected, clamp(fres, 0.0, 1.0));
+        vec3 hv = normalize(u_light + view);
+        float power = mix(400.0, 25.0, rough);
+        c += vec3(1.0, 0.96, 0.88) * pow(max(dot(n, hv), 0.0), power) * mix(1.2, 0.25, rough);
+        // Foam on the highest crests in a rough sea.
+        float foam = smoothstep(0.7, 1.2, crest) * smoothstep(0.0, 1.5, fine) *
+                     clamp((u_wave_height - 1.0) / 3.0, 0.0, 0.7) * (1.0 - rough);
+        c = mix(c, vec3(0.85, 0.9, 0.92), foam);
     } else {
         c = vec3(0.10, 0.16, 0.24);
     }
@@ -145,6 +197,12 @@ void main() {
 
 constexpr int kSurfaceRings = 96;
 constexpr int kSurfaceSegments = 160;
+constexpr int kSurfaceFloats = 10;  // eye-relative position 3, up 3, lat/lon 2, wave plane 2
+constexpr int kWaves = 24;
+constexpr int kVertexWaves = 6;
+// Wave numbers are whole multiples of 2 pi / kWavePeriod, so the wave field
+// repeats every kWavePeriod metres and the anchor can move by that much unseen.
+constexpr double kWavePeriod = 2048.0;
 
 std::array<float, 16> to_float(const Mat4d& m) {
     std::array<float, 16> f{};
@@ -199,19 +257,21 @@ Renderer::Renderer() {
     gl::BindVertexArray(surface_vao_);
     gl::GenBuffers(1, &surface_vbo_);
     gl::BindBuffer(GL_ARRAY_BUFFER, surface_vbo_);
-    gl::BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>((1 + kSurfaceRings * kSurfaceSegments) * 8 * sizeof(float)),
+    gl::BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>((1 + kSurfaceRings * kSurfaceSegments) * kSurfaceFloats * sizeof(float)),
                    nullptr, GL_STREAM_DRAW);
     gl::GenBuffers(1, &surface_ibo_);
     gl::BindBuffer(GL_ELEMENT_ARRAY_BUFFER, surface_ibo_);
     gl::BufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(idx.size() * sizeof(std::uint32_t)), idx.data(),
                    GL_STATIC_DRAW);
-    const GLsizei stride = 8 * sizeof(float);
+    const GLsizei stride = kSurfaceFloats * sizeof(float);
     gl::EnableVertexAttribArray(0);
     gl::VertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, nullptr);
     gl::EnableVertexAttribArray(1);
     gl::VertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(3 * sizeof(float)));
     gl::EnableVertexAttribArray(2);
     gl::VertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(6 * sizeof(float)));
+    gl::EnableVertexAttribArray(3);
+    gl::VertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(8 * sizeof(float)));
     gl::BindVertexArray(0);
 }
 
@@ -311,15 +371,31 @@ void Renderer::draw_surface(const Camera& camera, const RenderSettings& settings
     const Vec3d e = local_east(eye.lat, eye.lon), n = local_north(eye.lat, eye.lon);
     const Vec3d nadir = geodetic_to_ecef({eye.lat, eye.lon, level});
 
+    // Wave plane: metres east and north of an anchor near the eye. The anchor
+    // moves by whole wave periods, so the waves do not jump when it does.
+    if (!wave_anchor_set_) set_wave_anchor(eye.lat, eye.lon);
+    {
+        const Vec3d d = nadir - wave_anchor_;
+        const double u = dot(d, wave_east_), v = dot(d, wave_north_);
+        if (std::max(std::fabs(u), std::fabs(v)) > 4.0 * kWavePeriod) {
+            const double su = std::round(u / kWavePeriod) * kWavePeriod, sv = std::round(v / kWavePeriod) * kWavePeriod;
+            const Geodetic a = ecef_to_geodetic(wave_anchor_ + wave_east_ * su + wave_north_ * sv);
+            set_wave_anchor(a.lat, a.lon);
+        }
+    }
+
     surface_vertices_.clear();
-    surface_vertices_.reserve(static_cast<std::size_t>(1 + kSurfaceRings * kSurfaceSegments) * 8);
+    surface_vertices_.reserve(static_cast<std::size_t>(1 + kSurfaceRings * kSurfaceSegments) * kSurfaceFloats);
     auto push = [&](double lat, double lon) {
-        const Vec3d p = geodetic_to_ecef({lat, lon, level_at(lat, lon)}) - camera.position;
+        const Vec3d w = geodetic_to_ecef({lat, lon, level_at(lat, lon)});
+        const Vec3d p = w - camera.position;
         const Vec3d up = ellipsoid_up(lat, lon);
+        const Vec3d a = w - wave_anchor_;
         surface_vertices_.insert(surface_vertices_.end(),
                                  {static_cast<float>(p.x), static_cast<float>(p.y), static_cast<float>(p.z),
                                   static_cast<float>(up.x), static_cast<float>(up.y), static_cast<float>(up.z),
-                                  static_cast<float>(lat), static_cast<float>(lon)});
+                                  static_cast<float>(lat), static_cast<float>(lon),
+                                  static_cast<float>(dot(a, wave_east_)), static_cast<float>(dot(a, wave_north_))});
     };
     push(eye.lat, eye.lon);
     for (int i = 0; i < kSurfaceRings; ++i) {
@@ -342,8 +418,16 @@ void Renderer::draw_surface(const Camera& camera, const RenderSettings& settings
                   static_cast<float>(light.y), static_cast<float>(light.z));
     gl::Uniform3f(gl::GetUniformLocation(surface_program_, "u_sky"), sky[0], sky[1], sky[2]);
     gl::Uniform1f(gl::GetUniformLocation(surface_program_, "u_haze_distance"), static_cast<float>(haze));
-    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    gl::Uniform1f(gl::GetUniformLocation(surface_program_, "u_time"), static_cast<float>(std::fmod(seconds, 1000.0)));
+    const auto waves = wave_uniforms(settings);
+    const int wave_count = settings.sea && settings.waves && settings.wave_height > 0.0f ? kWaves : 0;
+    gl::Uniform1i(gl::GetUniformLocation(surface_program_, "u_wave_count"), wave_count);
+    gl::Uniform1i(gl::GetUniformLocation(surface_program_, "u_vertex_waves"), kVertexWaves);
+    gl::Uniform4fv(gl::GetUniformLocation(surface_program_, "u_wave"), kWaves, waves.data());
+    gl::Uniform3f(gl::GetUniformLocation(surface_program_, "u_east"), static_cast<float>(wave_east_.x),
+                  static_cast<float>(wave_east_.y), static_cast<float>(wave_east_.z));
+    gl::Uniform3f(gl::GetUniformLocation(surface_program_, "u_north"), static_cast<float>(wave_north_.x),
+                  static_cast<float>(wave_north_.y), static_cast<float>(wave_north_.z));
+    gl::Uniform1f(gl::GetUniformLocation(surface_program_, "u_wave_height"), settings.wave_height);
     gl::BindVertexArray(surface_vao_);
     gl::BindBuffer(GL_ARRAY_BUFFER, surface_vbo_);
     gl::BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(surface_vertices_.size() * sizeof(float)),
@@ -353,6 +437,49 @@ void Renderer::draw_surface(const Camera& camera, const RenderSettings& settings
     gl::DrawElements(GL_TRIANGLES, surface_index_count_, GL_UNSIGNED_INT, nullptr);
     gl::DepthMask(GL_TRUE);
     gl::BindVertexArray(0);
+}
+
+void Renderer::set_wave_anchor(double lat, double lon) {
+    wave_anchor_ = geodetic_to_ecef({lat, lon, 0.0});
+    wave_east_ = local_east(lat, lon);
+    wave_north_ = local_north(lat, lon);
+    wave_anchor_set_ = true;
+}
+
+std::vector<float> Renderer::wave_uniforms(const RenderSettings& settings) const {
+    // A wind sea: the dominant wave is 0.4 H high (crest) with steepness
+    // k a = 0.1, so its length grows with H; shorter waves down to a metre are
+    // slightly less steep. They spread around the downwind direction.
+    // Fixed pseudo-random jitter in length, direction and phase keeps the
+    // crests short and irregular instead of a regular lattice.
+    auto jitter = [](int i, double salt) {  // in [-1, 1)
+        const double x = std::sin(i * 12.9898 + salt * 78.233) * 43758.5453;
+        return 2.0 * (x - std::floor(x)) - 1.0;
+    };
+    constexpr double g = 9.81;
+    const double height = std::max(static_cast<double>(settings.wave_height), 0.0);
+    const double a0 = 0.4 * height;
+    const double longest = std::clamp(2.0 * kPi * a0 / 0.1, 6.0, 400.0);
+    const double ratio = std::pow(1.0 / longest, 1.0 / (kWaves - 1));
+    const double t = fixed_time_ ? *fixed_time_
+                                 : std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+    const double unit = 2.0 * kPi / kWavePeriod;
+    std::vector<float> w(static_cast<std::size_t>(kWaves) * 4);
+    for (int i = 0; i < kWaves; ++i) {
+        const double wavelength = longest * std::pow(ratio, i + 0.4 * jitter(i, 1.0));
+        // Waves travel downwind, within +-70 degrees, most of them close to it.
+        const double spread = 70.0 * jitter(i, 2.0) * std::fabs(jitter(i, 3.0));
+        const double dir = (settings.wind_from + 180.0 + spread) * kDegToRad;
+        const double k = 2.0 * kPi / wavelength;
+        const double kx = std::round(k * std::sin(dir) / unit) * unit, ky = std::round(k * std::cos(dir) / unit) * unit;
+        const double omega = std::sqrt(g * std::hypot(kx, ky));  // deep water: c = sqrt(g / k)
+        const double phase0 = kPi * jitter(i, 4.0);
+        w[i * 4] = static_cast<float>(kx);
+        w[i * 4 + 1] = static_cast<float>(ky);
+        w[i * 4 + 2] = static_cast<float>(a0 * std::pow(wavelength / longest, 1.2));
+        w[i * 4 + 3] = static_cast<float>(std::fmod(omega * t + phase0, 2.0 * kPi));
+    }
+    return w;
 }
 
 void Renderer::draw(const std::vector<DrawTile>& tiles, const Camera& camera, int width, int height,
