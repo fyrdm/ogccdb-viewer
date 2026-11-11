@@ -48,6 +48,11 @@ public:
               int width, int height, const RenderSettings& settings);
 
     const RenderStats& stats() const { return stats_; }
+
+    /// Draws lines through ECEF points (GL_LINE_STRIP or GL_LINES) over the
+    /// last draw(). Where terrain hides them they are drawn with `hidden_alpha`.
+    void draw_lines(const std::vector<ogccdb::runtime::Vec3d>& points, GLenum mode, const float rgba[4],
+                    const ogccdb::runtime::Camera& camera, float hidden_alpha = 0.3f);
     /// Fix the wave clock at `seconds` (for reproducible screenshots and frame
     /// sequences); by default it runs in real time.
     void set_clock(double seconds) { fixed_time_ = seconds; }
@@ -70,6 +75,9 @@ private:
     std::vector<float> wave_uniforms(const RenderSettings& settings) const;
 
     GLuint terrain_program_ = 0;
+    GLuint line_program_ = 0;
+    GLuint line_vao_ = 0, line_vbo_ = 0;
+    std::vector<float> line_vertices_;
     std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
     std::optional<double> fixed_time_;
     bool wave_anchor_set_ = false;

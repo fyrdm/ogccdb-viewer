@@ -3,6 +3,7 @@
 #include <GLFW/glfw3.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -14,6 +15,8 @@
 #include <vector>
 
 #include "gl.hpp"
+#include "file_browser.hpp"
+#include "flight_player.hpp"
 #include "fly_camera.hpp"
 #include "geoid.hpp"
 #include "globe_camera.hpp"
@@ -28,6 +31,8 @@
 
 using namespace ogccdb;
 using namespace ogccdb::runtime;
+using ogccdb::flight::FlightPose;
+using ogccdb::flight::camera_axes;
 
 namespace {
 
@@ -47,6 +52,9 @@ struct Args {
     double sea_offset = 0.0;
     std::optional<double> wave_height, wind_from;
     int frames = 1;
+    std::optional<std::string> bag;
+    std::optional<double> bag_time, play_speed, mount_pitch;
+    bool play = false, no_drone_camera = false;
 };
 
 void usage() {
@@ -79,7 +87,14 @@ void usage() {
         "          E/Space up, Q/C down, Shift faster, Ctrl slower, wheel speed,\n"
         "          arrows look, G walks on the ground, hold right button to zoom\n"
         "[ ] narrow / widen the field of view\n"
-        "V switches orbit / free fly, H toggles the panels");
+        "V switches orbit / free fly, H toggles the panels\n"
+        "flight playback (ROS 2 bag, MCAP or SQLite storage):\n"
+        "  --bag <folder|file.mcap|file.db3>  open a bag; a folder of bags opens the bag browser\n"
+        "  --bag-time <s>              start at this many seconds into the bag\n"
+        "  --play [--speed <k>]        start playing (k times real time)\n"
+        "  --camera-tilt <deg>         drone camera tilt from the body's forward (default -90, down)\n"
+        "  --no-drone-camera           start with the orbit / fly camera instead\n"
+        "  keys: P play/pause, B drone camera on/off, Left/Right seek 5 s in the drone camera");
 }
 
 std::optional<Args> parse(int argc, char** argv) {
@@ -102,6 +117,12 @@ std::optional<Args> parse(int argc, char** argv) {
         else if (s == "--fov") { if (!number(a.fov)) return std::nullopt; }
         else if (s == "--height") { if (!number(a.eye_height)) return std::nullopt; }
         else if (s == "--fly") a.fly = true;
+        else if (s == "--bag") { const char* v = next(); if (!v) return std::nullopt; a.bag = v; }
+        else if (s == "--bag-time") { if (!number(a.bag_time)) return std::nullopt; }
+        else if (s == "--speed") { if (!number(a.play_speed)) return std::nullopt; }
+        else if (s == "--camera-tilt") { if (!number(a.mount_pitch)) return std::nullopt; }
+        else if (s == "--play") a.play = true;
+        else if (s == "--no-drone-camera") a.no_drone_camera = true;
         else if (s == "--exaggeration") { const char* v = next(); if (!v) return std::nullopt; a.exaggeration = static_cast<float>(std::atof(v)); }
         else if (s == "--screen-error") { const char* v = next(); if (!v) return std::nullopt; a.max_screen_error = std::atof(v); }
         else if (s == "--lod-colors") a.lod_colors = true;
@@ -142,7 +163,8 @@ std::optional<Args> parse(int argc, char** argv) {
 
 /// Terrain height at (lat, lon) from the finest drawn tile over it, by bilinear
 /// interpolation of its mesh grid; nullopt if no drawn tile covers it.
-std::optional<double> ground_height(const std::vector<DrawTile>& tiles, double lat, double lon, int resolution) {
+std::optional<double> ground_height(const std::vector<DrawTile>& tiles, double lat, double lon, int resolution,
+                                    int* lod = nullptr) {
     const DrawTile* best = nullptr;
     for (const DrawTile& d : tiles) {
         const GeoExtent e = cdb13::extent(d.tile);
@@ -151,6 +173,7 @@ std::optional<double> ground_height(const std::vector<DrawTile>& tiles, double l
         }
     }
     if (!best) return std::nullopt;
+    if (lod) *lod = best->tile.lod;
     const GeoExtent e = cdb13::extent(best->tile);
     const auto& h = best->data->mesh.heights;
     const int side = resolution + 1;
@@ -275,7 +298,8 @@ void scroll_callback(GLFWwindow* w, double xoff, double yoff) {
 }
 
 void ui(Views& v, Terrain& terrain, Renderer& renderer, RenderSettings& settings, SelectionOptions& sel, Sea& sea,
-        const Args& args, double fps, bool& show_ui) {
+        FlightPlayer& player, FileBrowser& browser, std::optional<double> agl, const Args& args, double fps,
+        bool& show_ui) {
     if (!show_ui) return;
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(360, 0), ImGuiCond_FirstUseEver);
@@ -285,6 +309,7 @@ void ui(Views& v, Terrain& terrain, Renderer& renderer, RenderSettings& settings
     ImGui::Text("Elevation tiles %zu, Imagery tiles %zu", idx.elevation_count(), idx.imagery_count());
     if (const auto e = idx.extent()) ImGui::Text("Extent %.0f..%.0f N, %.0f..%.0f E", e->south, e->north, e->west, e->east);
 
+    flight_ui(player, browser, agl);
     if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
         // Field of view, shared by both cameras. The runtime picks LODs for it,
         // so a narrow view (telephoto) loads finer tiles far away.
@@ -427,9 +452,60 @@ void ui(Views& v, Terrain& terrain, Renderer& renderer, RenderSettings& settings
             "Free fly: mouse look (click the view or Tab to capture, Esc/Tab to release), "
             "WASD move, E/Space up, Q/C down, Shift faster, Ctrl slower, wheel speed, "
             "arrows look, G walk on ground.\n"
-            "V: orbit / free fly. H: hide panels.");
+            "V: orbit / free fly. H: hide panels.\n"
+            "Flight: P play/pause, B drone camera, Left/Right seek 5 s (drone camera).");
     }
     ImGui::End();
+}
+
+/// Flight path (flown part bright, the rest faint) and, outside the drone
+/// camera, the vehicle: its arms, nose and the camera's view on the ground.
+void draw_flight(Renderer& renderer, FlightPlayer& player, const FlightPose& p, bool drone_view, const Camera& rc,
+                 double ground_below) {
+    if (player.show_path) {
+        const auto& path = player.flight_path();
+        const auto& times = player.track().path_times();
+        const std::size_t split =
+            static_cast<std::size_t>(std::upper_bound(times.begin(), times.end(), player.time) - times.begin());
+        const float done[4] = {1.0f, 0.75f, 0.15f, 1.0f}, todo[4] = {0.9f, 0.9f, 0.95f, 0.45f};
+        if (split >= 1) {
+            std::vector<Vec3d> a(path.begin(), path.begin() + static_cast<std::ptrdiff_t>(split));
+            a.push_back(p.position);
+            renderer.draw_lines(a, GL_LINE_STRIP, done, rc);
+        }
+        if (split < path.size()) {
+            std::vector<Vec3d> b{p.position};
+            b.insert(b.end(), path.begin() + static_cast<std::ptrdiff_t>(split), path.end());
+            renderer.draw_lines(b, GL_LINE_STRIP, todo, rc);
+        }
+    }
+    if (drone_view) return;
+    // The vehicle, drawn large enough to see from afar.
+    const double size = std::max(1.0, length(p.position - rc.position) * 0.03);
+    const Vec3d c = p.position;
+    const Vec3d f = p.forward * size, l = p.left * size;
+    const float white[4] = {1, 1, 1, 1}, red[4] = {1.0f, 0.25f, 0.2f, 1}, cyan[4] = {0.3f, 0.9f, 1.0f, 0.9f};
+    renderer.draw_lines({c + (f + l) * 0.7, c - (f + l) * 0.7, c + (f - l) * 0.7, c - (f - l) * 0.7}, GL_LINES, white, rc);
+    renderer.draw_lines({c, c + f * 1.6}, GL_LINES, red, rc);
+    // Camera footprint: the view's corner rays down to the ground below the vehicle.
+    Vec3d cf, cu;
+    camera_axes(p, player.mount_pitch, cf, cu);
+    const Vec3d cr = normalize(cross(cf, cu));
+    const double ty = std::tan(rc.fov_y / 2.0), tx = ty * rc.aspect;
+    const Vec3d up = ellipsoid_up(p.geodetic.lat, p.geodetic.lon);
+    const double above = p.geodetic.height - ground_below;
+    std::vector<Vec3d> rays, frame;
+    for (const auto& k : {std::array<double, 2>{-1, -1}, {1, -1}, {1, 1}, {-1, 1}}) {
+        const Vec3d d = normalize(cf + cr * (k[0] * tx) + cu * (k[1] * ty));
+        const double down = -dot(d, up);
+        const double reach = down > 0.05 && above > 0 ? std::min(above / down, above * 20.0) : size * 3.0;
+        rays.push_back(c);
+        rays.push_back(c + d * reach);
+        frame.push_back(c + d * reach);
+    }
+    frame.push_back(frame.front());
+    renderer.draw_lines(rays, GL_LINES, cyan, rc, 0.15f);
+    renderer.draw_lines(frame, GL_LINE_STRIP, cyan, rc, 0.15f);
 }
 
 }  // namespace
@@ -563,6 +639,44 @@ int main(int argc, char** argv) {
         };
         double& ground = views.ground;
         bool ground_known = false;
+
+        FlightPlayer player;
+        FileBrowser browser;
+        // A newly opened flight: the orbit camera looks at where it starts.
+        auto on_loaded = [&]() {
+            const Geodetic g = player.start();
+            cam.lat = g.lat;
+            cam.lon = g.lon;
+            cam.height = g.height;
+            cam.distance = 1500.0;
+            cam.pitch = -45.0;
+            cam.clamp();
+            ground_known = false;
+            std::printf("flight: %s, %.1f s, position from %s\n", player.path().string().c_str(),
+                        player.track().duration(), player.track().info().position_source.c_str());
+        };
+        if (args.bag && std::filesystem::is_directory(*args.bag) && !ogccdb::flight::is_bag(*args.bag)) {
+            browser.open(*args.bag);  // a folder of bags: let the user pick one
+        } else if (args.bag) {
+            if (player.load(*args.bag)) {
+                on_loaded();
+                // Explicit view options win over the default view of the flight.
+                if (args.lat) cam.lat = *args.lat;
+                if (args.lon) cam.lon = *args.lon;
+                if (args.distance) cam.distance = *args.distance;
+                if (args.heading) cam.heading = *args.heading;
+                if (args.pitch) cam.pitch = *args.pitch;
+                cam.clamp();
+                if (args.bag_time) player.seek(player.track().start() + *args.bag_time);
+                if (args.play_speed) player.speed = static_cast<float>(*args.play_speed);
+                if (args.mount_pitch) player.mount_pitch = static_cast<float>(std::clamp(*args.mount_pitch, -90.0, 0.0));
+                player.playing = args.play;
+                player.drone_camera = !args.no_drone_camera;
+            } else {
+                std::fprintf(stderr, "ogccdb-viewer: %s\n", player.error().c_str());
+            }
+        }
+        bool p_was_down = false, b_was_down = false, left_was_down = false, right_was_down = false;
         int stable_frames = 0;
         int frame = 0;
         auto last_time = std::chrono::steady_clock::now();
@@ -574,6 +688,10 @@ int main(int argc, char** argv) {
             const double dt = std::chrono::duration<double>(now - last_time).count();
             last_time = now;
             if (dt > 0) fps = fps * 0.9 + 0.1 / dt;
+            // Flight clock: real time, or 1/30 s per saved frame for --frames.
+            player.update(args.screenshot ? (saved_frames > 0 ? 1.0 / 30.0 : 0.0) : dt);
+            const bool drone_view = player.loaded() && player.drone_camera;
+            if (drone_view && views.mouse_captured) set_capture(false);
 
             int fb_w = 0, fb_h = 0, win_w = 0, win_h = 0;
             glfwGetFramebufferSize(window, &fb_w, &fb_h);
@@ -595,7 +713,9 @@ int main(int argc, char** argv) {
                 was_flying = views.flying;
             }
             const double fly_above = ecef_to_geodetic(fly.position).height - views.eye_ground;
-            if (views.mouse_captured) {
+            if (drone_view) {
+                g_input.dragging_left = g_input.dragging_right = false;
+            } else if (views.mouse_captured) {
                 const double dx = mx - g_input.last_x, dy = my - g_input.last_y;
                 // Holding the right button zooms 4x; look slows down with it.
                 const double sens = views.sensitivity * (right ? 0.25 : 1.0);
@@ -627,7 +747,36 @@ int main(int argc, char** argv) {
             }
             if (!io.WantCaptureKeyboard) {
                 auto down = [&](int key) { return glfwGetKey(window, key) == GLFW_PRESS; };
-                if (views.flying) {
+                const bool pk = down(GLFW_KEY_P), bk = down(GLFW_KEY_B), lk = down(GLFW_KEY_LEFT), rk = down(GLFW_KEY_RIGHT);
+                if (player.loaded()) {
+                    if (pk && !p_was_down) {
+                        if (!player.playing && player.time >= player.track().end()) player.seek(player.track().start());
+                        player.playing = !player.playing;
+                    }
+                    if (bk && !b_was_down) {
+                        if (player.drone_camera) {  // leave the drone camera where the drone is
+                            const FlightPose p = player.pose();
+                            cam.lat = p.geodetic.lat;
+                            cam.lon = p.geodetic.lon;
+                            cam.height = p.geodetic.height;
+                            cam.distance = 300.0;
+                            cam.pitch = -35.0;
+                            cam.heading = p.yaw;
+                            cam.clamp();
+                            views.flying = false;
+                        }
+                        player.drone_camera = !player.drone_camera;
+                    }
+                    if (drone_view && lk && !left_was_down) player.seek(player.time - 5.0);
+                    if (drone_view && rk && !right_was_down) player.seek(player.time + 5.0);
+                }
+                p_was_down = pk;
+                b_was_down = bk;
+                left_was_down = lk;
+                right_was_down = rk;
+                if (drone_view) {
+                    // The flight drives the camera.
+                } else if (views.flying) {
                     double speed = fly.speed(fly_above);
                     if (down(GLFW_KEY_LEFT_SHIFT) || down(GLFW_KEY_RIGHT_SHIFT)) speed *= 5.0;
                     if (down(GLFW_KEY_LEFT_CONTROL) || down(GLFW_KEY_RIGHT_CONTROL)) speed *= 0.2;
@@ -686,7 +835,19 @@ int main(int argc, char** argv) {
 
             // Terrain.
             terrain->set_selection_options(selection);
-            const Camera rc = views.flying
+            std::optional<FlightPose> drone;
+            if (player.loaded()) {
+                drone = player.pose();
+                if (player.follow && !drone_view && !views.flying) {
+                    cam.lat = drone->geodetic.lat;
+                    cam.lon = drone->geodetic.lon;
+                }
+            }
+            Vec3d drone_fwd, drone_up;
+            if (drone) camera_axes(*drone, player.mount_pitch, drone_fwd, drone_up);
+            const Camera rc = drone_view ? make_camera(drone->position, drone_fwd, drone_up, fly.fov_y_deg, fb_w, fb_h,
+                                                       views.eye_ground, 5.0e4)
+                              : views.flying
                                   ? make_camera(fly.position, fly.forward(), fly.up(),
                                                 fly.fov_y_deg * (views.mouse_captured && right ? 0.25 : 1.0), fb_w, fb_h,
                                                 views.eye_ground, 5.0e4)
@@ -706,11 +867,26 @@ int main(int argc, char** argv) {
                 return h;
             };
             if (!views.flying) {
-                if (const auto g = surface(cam.lat, cam.lon)) {
+                if (player.loaded() && player.follow && !drone_view) {
+                    cam.height = drone->geodetic.height;  // orbit the vehicle itself
+                    ground_known = true;
+                } else if (const auto g = surface(cam.lat, cam.lon)) {
                     ground = *g;
                     cam.height = ground_known ? cam.height + (ground - cam.height) * std::min(1.0, 10.0 * dt) : ground;
                     ground_known = true;
                 }
+            }
+            std::optional<double> drone_agl;
+            if (drone) {
+                // Put a flight that starts on the ground on the terrain, once the
+                // tiles there are loaded (a finer tile improves it).
+                const TerrainStats ts = terrain->stats();
+                if (player.altitude == FlightPlayer::Altitude::StartOnGround && ts.queued == 0 && ts.loading == 0) {
+                    const Geodetic s0 = player.start();
+                    int lod = 0;
+                    if (const auto g = ground_height(draw, s0.lat, s0.lon, res, &lod)) player.offer_ground(*g, lod);
+                }
+                if (const auto g = surface(drone->geodetic.lat, drone->geodetic.lon)) drone_agl = drone->geodetic.height - *g;
             }
             const Geodetic eye_geo = ecef_to_geodetic(rc.position);
             if (const auto g = surface(eye_geo.lat, eye_geo.lon)) {
@@ -723,12 +899,32 @@ int main(int argc, char** argv) {
             }
 
             renderer.draw(draw, rc, fb_w, fb_h, settings);
+            if (drone) {
+                draw_flight(renderer, player, *drone, drone_view, rc, views.eye_ground);
+            }
 
             ImGui_ImplOpenGL3_NewFrame();
             ImGui_ImplGlfw_NewFrame();
             ImGui::NewFrame();
-            ui(views, *terrain, renderer, settings, selection, sea, args, fps, show_ui);
-            if (views.flying) {
+            ui(views, *terrain, renderer, settings, selection, sea, player, browser, drone_agl, args, fps, show_ui);
+            if (const auto chosen = browser.draw()) {
+                if (player.load(*chosen)) on_loaded();
+            }
+            if (drone_view && !(args.screenshot && args.hide_ui)) {
+                ImDrawList* fg = ImGui::GetForegroundDrawList();
+                char hud[256];
+                const double t = player.time - player.track().start();
+                std::snprintf(hud, sizeof hud,
+                              "Drone camera  %d:%04.1f %s %.1fx   AGL %.0f m   hdg %03.0f   %.1f m/s   "
+                              "(P play, Left/Right seek, B leave)",
+                              static_cast<int>(t / 60), std::fmod(t, 60.0), player.playing ? ">" : "||", player.speed,
+                              drone_agl.value_or(0.0), drone->yaw, drone->ground_speed);
+                const ImVec2 ts = ImGui::CalcTextSize(hud);
+                const float cx = io.DisplaySize.x * 0.5f;
+                fg->AddRectFilled(ImVec2(cx - ts.x * 0.5f - 8, 8), ImVec2(cx + ts.x * 0.5f + 8, 16 + ts.y),
+                                  IM_COL32(0, 0, 0, 140), 4.0f);
+                fg->AddText(ImVec2(cx - ts.x * 0.5f, 12), IM_COL32(255, 255, 255, 230), hud);
+            } else if (views.flying) {
                 ImDrawList* fg = ImGui::GetForegroundDrawList();
                 const ImVec2 c(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
                 const char* hint = views.mouse_captured

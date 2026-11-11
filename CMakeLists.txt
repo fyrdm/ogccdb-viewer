@@ -41,18 +41,23 @@ add_library(imgui STATIC
 target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(imgui PUBLIC glfw ${CMAKE_DL_LIBS})
 
+include(CTest)
+add_subdirectory(flight)
+
 add_executable(ogccdb-viewer
   src/main.cpp
   src/gl.cpp
   src/shader.cpp
   src/globe_camera.cpp
   src/fly_camera.cpp
+  src/file_browser.cpp
+  src/flight_player.cpp
   src/geoid.cpp
   src/renderer.cpp
   src/screenshot.cpp
 )
 target_include_directories(ogccdb-viewer SYSTEM PRIVATE ${OGCCDB_GLCOREARB_DIR} ${stb_SOURCE_DIR})
-target_link_libraries(ogccdb-viewer PRIVATE ogccdb::runtime GDAL::GDAL imgui glfw)
+target_link_libraries(ogccdb-viewer PRIVATE ogccdb::runtime ogccdb::flight GDAL::GDAL imgui glfw)
 target_compile_options(ogccdb-viewer PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>
   $<$<CXX_COMPILER_ID:MSVC>:/W4>
