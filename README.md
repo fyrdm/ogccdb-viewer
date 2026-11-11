@@ -41,16 +41,19 @@ Two camera modes; **V** (or the panel) switches between them.
 | Right or middle drag / Q E R F | rotate and tilt |
 | Wheel / + - | zoom |
 
-| Free fly | |
+| Free fly (like a first-person game) | |
 | --- | --- |
-| Drag / arrow keys | look around (pitch -90..+90) |
+| Mouse | look around; the cursor is captured (click the view or Tab to capture, Esc or Tab to release) |
 | W S A D | forward, back, left, right |
 | E or Space / Q or C | up / down |
 | Shift / Ctrl | 5x faster / 5x slower |
 | Wheel | speed (scales with height above ground) |
+| G | walk on the ground at a set eye height (1.8 m), or fly again |
+| Arrow keys | look around without the mouse |
 
 Free fly goes anywhere, also below the terrain: seen from below, tiles are drawn darker
-and the skirts show as thin walls. **H** shows or hides the panel.
+and the skirts show as thin walls. Mouse sensitivity and invert Y are in the panel.
+**H** shows or hides the panel.
 
 The panel shows the store, camera, render options (imagery, lighting, haze, wireframe, LOD
 colours, vertical exaggeration, screen-space error, max LOD) and streaming statistics.

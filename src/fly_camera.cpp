@@ -35,9 +35,20 @@ double FlyCamera::speed(double height_above_ground) const {
     return std::clamp(std::fabs(height_above_ground), 5.0, 2.0e6) * speed_factor;
 }
 
-void FlyCamera::move(double ahead, double side, double rise, double metres_per_second, double dt) {
+void FlyCamera::move(double ahead, double side, double rise, double metres_per_second, double dt, bool level) {
     const double step = metres_per_second * dt;
-    position += forward() * (ahead * step) + right() * (side * step) + local_up() * (rise * step);
+    Vec3d dir = forward();
+    if (level) {
+        const Geodetic g = where(*this);
+        const double h = heading * kDegToRad;
+        dir = local_east(g.lat, g.lon) * std::sin(h) + local_north(g.lat, g.lon) * std::cos(h);
+    }
+    position += dir * (ahead * step) + right() * (side * step) + local_up() * (rise * step);
+}
+
+void FlyCamera::set_height(double height) {
+    const Geodetic g = where(*this);
+    position = geodetic_to_ecef({g.lat, g.lon, height});
 }
 
 void FlyCamera::look(double dheading, double dpitch) {
