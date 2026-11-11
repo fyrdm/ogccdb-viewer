@@ -62,6 +62,8 @@ void main() {
         c *= 0.55 + 0.6 * d;
     }
     c = mix(c, u_tint.rgb, u_tint.a);
+    // Seen from below (underground): darker and warmer, so the underside is obvious.
+    if (!gl_FrontFacing) c = mix(c * 0.45, vec3(0.45, 0.25, 0.20), 0.25);
     if (u_haze_distance > 0.0) {
         float f = 1.0 - exp(-v_distance / u_haze_distance);
         c = mix(c, u_haze_color, clamp(f, 0.0, 0.85));
