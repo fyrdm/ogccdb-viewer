@@ -50,6 +50,10 @@ Two camera modes; **V** (or the panel) switches between them.
 | Wheel | speed (scales with height above ground) |
 | G | walk on the ground at a set eye height (1.8 m), or fly again |
 | Arrow keys | look around without the mouse |
+| Hold right button | zoom 4x (binoculars), with slower look |
+
+The field of view (5–120°, vertical; default 45°) is in the panel, on `[` `]`, and on
+`--fov`. LOD selection follows it, so a narrow view loads finer tiles in the distance.
 
 Free fly goes anywhere, also below the terrain: seen from below, tiles are drawn darker
 and the skirts show as thin walls. Mouse sensitivity and invert Y are in the panel.
