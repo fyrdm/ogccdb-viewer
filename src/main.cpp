@@ -38,6 +38,8 @@ struct Args {
     double max_screen_error = 1.5;
     bool lod_colors = false;
     bool hide_ui = false;
+    bool skirts = true;
+    int mesh_resolution = 32;
 };
 
 void usage() {
@@ -53,6 +55,8 @@ void usage() {
         "  --size <w>x<h>              window size (default 1600x1000)\n"
         "  --screenshot <file.png>     render until all tiles are loaded, save, exit\n"
         "  --no-ui                     hide the panels\n"
+        "  --no-skirts                 draw tiles without skirts (shows cracks)\n"
+        "  --mesh-resolution <n>       grid cells per tile side (default 32)\n"
         "controls: left drag pan, right drag rotate/tilt, wheel zoom,\n"
         "          WASD pan, Q/E rotate, R/F tilt, +/- zoom, H toggles the panels");
 }
@@ -78,6 +82,8 @@ std::optional<Args> parse(int argc, char** argv) {
         else if (s == "--screen-error") { const char* v = next(); if (!v) return std::nullopt; a.max_screen_error = std::atof(v); }
         else if (s == "--lod-colors") a.lod_colors = true;
         else if (s == "--no-ui") a.hide_ui = true;
+        else if (s == "--no-skirts") a.skirts = false;
+        else if (s == "--mesh-resolution") { const char* v = next(); if (!v) return std::nullopt; a.mesh_resolution = std::atoi(v); }
         else if (s == "--size") {
             const char* v = next();
             if (!v || std::sscanf(v, "%dx%d", &a.width, &a.height) != 2) return std::nullopt;
@@ -226,6 +232,8 @@ int main(int argc, char** argv) {
     try {
         TerrainOptions o;
         o.selection.max_screen_error = args.max_screen_error;
+        o.mesh.skirts = args.skirts;
+        o.mesh.resolution = args.mesh_resolution;
         terrain = std::make_unique<Terrain>(args.cdb, o);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "ogccdb-viewer: %s\n", e.what());
