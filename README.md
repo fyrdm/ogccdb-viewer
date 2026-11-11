@@ -55,11 +55,30 @@ Two camera modes; **V** (or the panel) switches between them.
 The field of view (5–120°, vertical; default 45°) is in the panel, on `[` `]`, and on
 `--fov`. LOD selection follows it, so a narrow view loads finer tiles in the distance.
 
+### Sea
+
+Where the store has no tiles, a sea is drawn: an imaginary reference surface that, like
+mean sea level in geodesy, runs on under the terrain and shows wherever the terrain is
+lower or missing. Its height above the ellipsoid is the geoid (EGM2008 if its PROJ grid is
+installed, else EGM96) or the ellipsoid itself, plus an offset you can raise to flood the
+terrain. Pick the reference that matches the store's heights: the geoid for ellipsoid
+heights, the ellipsoid for heights above sea level written as they are. A 1° graticule is
+drawn on it.
+
+```bash
+build-release/ogccdb-viewer <cdb> --sea ellipsoid --sea-offset 430   # flood to 430 m
+build-release/ogccdb-viewer <cdb> --sea off                          # dark background globe
+```
+
+`--sea` takes `auto` (default), `egm2008`, `egm96`, `ellipsoid` or `off`. The geoid comes
+from PROJ grids (`proj-data`, or `PROJ_NETWORK=ON`); without one the sea falls back to the
+ellipsoid and the panel says so.
+
 Free fly goes anywhere, also below the terrain: seen from below, tiles are drawn darker
 and the skirts show as thin walls. Mouse sensitivity and invert Y are in the panel.
 **H** shows or hides the panel.
 
 The panel shows the store, camera, render options (imagery, lighting, haze, wireframe, LOD
-colours, vertical exaggeration, screen-space error, max LOD) and streaming statistics.
+colours, sea and graticule, vertical exaggeration, screen-space error, max LOD) and streaming statistics.
 
 `--help` lists all options.
