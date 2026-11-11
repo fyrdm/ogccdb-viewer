@@ -32,7 +32,7 @@ namespace {
 
 struct Args {
     std::filesystem::path cdb;
-    std::optional<double> lat, lon, distance, heading, pitch, eye_height;
+    std::optional<double> lat, lon, distance, heading, pitch, eye_height, fov;
     bool fly = false;
     int width = 1600, height = 1000;
     std::optional<std::string> screenshot;
@@ -49,6 +49,7 @@ void usage() {
         "  --distance <m>              eye distance from the target\n"
         "  --heading <deg>             0 = looking north\n"
         "  --pitch <deg>               -90 = straight down (default -60)\n"
+        "  --fov <deg>                 vertical field of view (default 45)\n"
         "  --fly                       start in free-fly mode (at the orbit eye, or at --lat --lon --height)\n"
         "  --height <m>                free-fly eye height above the ellipsoid\n"
         "  --exaggeration <k>          vertical exaggeration (default 1)\n"
@@ -61,7 +62,8 @@ void usage() {
         "          WASD pan, Q/E rotate, R/F tilt, +/- zoom\n"
         "free fly: mouse look (click or Tab captures, Esc/Tab releases), WASD move,\n"
         "          E/Space up, Q/C down, Shift faster, Ctrl slower, wheel speed,\n"
-        "          arrows look, G walks on the ground\n"
+        "          arrows look, G walks on the ground, hold right button to zoom\n"
+        "[ ] narrow / widen the field of view\n"
         "V switches orbit / free fly, H toggles the panels");
 }
 
@@ -82,6 +84,7 @@ std::optional<Args> parse(int argc, char** argv) {
         else if (s == "--distance") { if (!number(a.distance)) return std::nullopt; }
         else if (s == "--heading") { if (!number(a.heading)) return std::nullopt; }
         else if (s == "--pitch") { if (!number(a.pitch)) return std::nullopt; }
+        else if (s == "--fov") { if (!number(a.fov)) return std::nullopt; }
         else if (s == "--height") { if (!number(a.eye_height)) return std::nullopt; }
         else if (s == "--fly") a.fly = true;
         else if (s == "--exaggeration") { const char* v = next(); if (!v) return std::nullopt; a.exaggeration = static_cast<float>(std::atof(v)); }
@@ -158,6 +161,12 @@ struct Views {
     bool invert_y = false;
 };
 
+void set_fov(Views& v, double deg) {
+    deg = std::clamp(deg, 5.0, 120.0);
+    v.orbit.fov_y_deg = deg;
+    v.fly.fov_y_deg = deg;
+}
+
 void orbit_to_fly(Views& v) {
     v.fly.position = v.orbit.eye();
     v.fly.heading = v.orbit.heading;
@@ -217,6 +226,19 @@ void ui(Views& v, Terrain& terrain, Renderer& renderer, RenderSettings& settings
     if (const auto e = idx.extent()) ImGui::Text("Extent %.0f..%.0f N, %.0f..%.0f E", e->south, e->north, e->west, e->east);
 
     if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Field of view, shared by both cameras. The runtime picks LODs for it,
+        // so a narrow view (telephoto) loads finer tiles far away.
+        float fov = static_cast<float>(v.flying ? v.fly.fov_y_deg : v.orbit.fov_y_deg);
+        if (ImGui::SliderFloat("FOV", &fov, 5.0f, 120.0f, "%.0f deg vertical")) set_fov(v, fov);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("45")) set_fov(v, 45.0);
+        {
+            const ImVec2 ds = ImGui::GetIO().DisplaySize;
+            const double hfov = 2.0 * std::atan(std::tan(v.fly.fov_y_deg * kDegToRad / 2.0) * ds.x / std::max(ds.y, 1.0f)) * kRadToDeg;
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            ImGui::TextWrapped("%.0f deg horizontal. [ ] change it; in free fly hold the right button to zoom.", hfov);
+            ImGui::PopStyleColor();
+        }
         int mode = v.flying ? 1 : 0;
         ImGui::RadioButton("Orbit", &mode, 0);
         ImGui::SameLine();
@@ -402,6 +424,7 @@ int main(int argc, char** argv) {
         if (args.distance) cam.distance = *args.distance;
         if (args.heading) cam.heading = *args.heading;
         if (args.pitch) cam.pitch = *args.pitch;
+        if (args.fov) set_fov(views, *args.fov);
         cam.clamp();
         if (args.fly) {
             orbit_to_fly(views);
@@ -466,7 +489,9 @@ int main(int argc, char** argv) {
             const double fly_above = ecef_to_geodetic(fly.position).height - views.eye_ground;
             if (views.mouse_captured) {
                 const double dx = mx - g_input.last_x, dy = my - g_input.last_y;
-                fly.look(dx * views.sensitivity, (views.invert_y ? dy : -dy) * views.sensitivity);
+                // Holding the right button zooms 4x; look slows down with it.
+                const double sens = views.sensitivity * (right ? 0.25 : 1.0);
+                fly.look(dx * sens, (views.invert_y ? dy : -dy) * sens);
             } else if (!io.WantCaptureMouse) {
                 const double dx = mx - g_input.last_x, dy = my - g_input.last_y;
                 if (views.flying) {
@@ -534,6 +559,8 @@ int main(int argc, char** argv) {
                 const bool h = down(GLFW_KEY_H);
                 if (h && !h_was_down) show_ui = !show_ui;
                 h_was_down = h;
+                if (down(GLFW_KEY_LEFT_BRACKET)) set_fov(views, fly.fov_y_deg - 30.0 * dt);
+                if (down(GLFW_KEY_RIGHT_BRACKET)) set_fov(views, fly.fov_y_deg + 30.0 * dt);
                 const bool tab = down(GLFW_KEY_TAB), gk = down(GLFW_KEY_G), esc = down(GLFW_KEY_ESCAPE);
                 if (views.flying && tab && !tab_was_down) set_capture(!views.mouse_captured);
                 if (views.flying && gk && !g_was_down) views.walk = !views.walk;
@@ -552,7 +579,8 @@ int main(int argc, char** argv) {
             // Terrain.
             terrain->set_selection_options(selection);
             const Camera rc = views.flying
-                                  ? make_camera(fly.position, fly.forward(), fly.up(), fly.fov_y_deg, fb_w, fb_h,
+                                  ? make_camera(fly.position, fly.forward(), fly.up(),
+                                                fly.fov_y_deg * (views.mouse_captured && right ? 0.25 : 1.0), fb_w, fb_h,
                                                 views.eye_ground, 5.0e4)
                                   : cam.to_runtime(fb_w, fb_h, ground_known ? ground : cam.height);
             const auto& draw = terrain->update(rc);
