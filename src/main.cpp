@@ -63,8 +63,9 @@ void usage() {
         "  --mesh-resolution <n>       grid cells per tile side (default 32)\n"
         "orbit:    left drag pan, right drag rotate/tilt, wheel zoom,\n"
         "          WASD pan, Q/E rotate, R/F tilt, +/- zoom\n"
-        "free fly: drag to look, WASD move, E/Space up, Q/C down, Shift faster,\n"
-        "          Ctrl slower, wheel sets speed, arrows look\n"
+        "free fly: mouse look (click or Tab captures, Esc/Tab releases), WASD move,\n"
+        "          E/Space up, Q/C down, Shift faster, Ctrl slower, wheel speed,\n"
+        "          arrows look, G walks on the ground\n"
         "V switches orbit / free fly, H toggles the panels");
 }
 
@@ -155,6 +156,12 @@ struct Views {
     bool flying = false;
     double ground = 0.0;      ///< terrain height under the orbit target
     double eye_ground = 0.0;  ///< terrain height under the free-fly eye
+    // Free-fly controls.
+    bool mouse_captured = false;  ///< mouse look: cursor hidden and locked to the window
+    bool walk = false;            ///< keep the eye at walk_height above the ground
+    float walk_height = 1.8f;     ///< metres
+    float sensitivity = 0.10f;    ///< degrees per mouse count
+    bool invert_y = false;
 };
 
 void orbit_to_fly(Views& v) {
@@ -256,6 +263,10 @@ void ui(Views& v, Terrain& terrain, Renderer& renderer, RenderSettings& settings
             if (ImGui::SliderFloat("Speed", &speed, 0.01f, 100.0f, "%.2fx", ImGuiSliderFlags_Logarithmic)) {
                 cam.speed_factor = speed;
             }
+            ImGui::Checkbox("Walk on ground (G)", &v.walk);
+            if (v.walk) ImGui::SliderFloat("Eye height", &v.walk_height, 0.5f, 50.0f, "%.1f m", ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("Mouse sensitivity", &v.sensitivity, 0.02f, 0.5f, "%.2f", ImGuiSliderFlags_Logarithmic);
+            ImGui::Checkbox("Invert Y", &v.invert_y);
             if (ImGui::Button("Level")) cam.pitch = 0.0;
             ImGui::SameLine();
             if (ImGui::Button("Look up")) cam.pitch = 60.0;
@@ -263,7 +274,11 @@ void ui(Views& v, Terrain& terrain, Renderer& renderer, RenderSettings& settings
             if (ImGui::Button("Go 100 m below ground")) {
                 cam.position = geodetic_to_ecef({eye.lat, eye.lon, v.eye_ground - 100.0});
                 cam.pitch = 30.0;
+                v.walk = false;
             }
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            ImGui::TextWrapped("Click the view or press Tab for mouse look; Esc or Tab releases the mouse.");
+            ImGui::PopStyleColor();
         }
     }
     if (ImGui::CollapsingHeader("Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -305,8 +320,9 @@ void ui(Views& v, Terrain& terrain, Renderer& renderer, RenderSettings& settings
         ImGui::TextWrapped(
             "Orbit: left drag pan, right drag rotate and tilt, wheel zoom, "
             "WASD pan, Q/E rotate, R/F tilt, +/- zoom.\n"
-            "Free fly: drag to look, WASD move, E/Space up, Q/C down, "
-            "Shift faster, Ctrl slower, wheel speed, arrows look.\n"
+            "Free fly: mouse look (click the view or Tab to capture, Esc/Tab to release), "
+            "WASD move, E/Space up, Q/C down, Shift faster, Ctrl slower, wheel speed, "
+            "arrows look, G walk on ground.\n"
             "V: orbit / free fly. H: hide panels.");
     }
     ImGui::End();
@@ -405,7 +421,23 @@ int main(int argc, char** argv) {
         FlyCamera& fly = views.fly;
 
         bool show_ui = !args.hide_ui;
-        bool h_was_down = false, v_was_down = false;
+        bool h_was_down = false, v_was_down = false, tab_was_down = false, g_was_down = false,
+             esc_was_down = false;
+        bool was_flying = false;
+        if (glfwRawMouseMotionSupported()) glfwSetInputMode(window, GLFW_RAW_MOUSE_MOTION, GLFW_TRUE);
+        // Mouse look locks and hides the cursor; the panel gets no mouse meanwhile.
+        auto set_capture = [&](bool on) {
+            if (args.screenshot) on = false;
+            views.mouse_captured = on;
+            glfwSetInputMode(window, GLFW_CURSOR, on ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+            ImGuiIO& gio = ImGui::GetIO();
+            if (on) {
+                gio.ConfigFlags |= ImGuiConfigFlags_NoMouse | ImGuiConfigFlags_NoMouseCursorChange;
+            } else {
+                gio.ConfigFlags &= ~(ImGuiConfigFlags_NoMouse | ImGuiConfigFlags_NoMouseCursorChange);
+            }
+            glfwGetCursorPos(window, &g_input.last_x, &g_input.last_y);
+        };
         double& ground = views.ground;
         bool ground_known = false;
         int stable_frames = 0;
@@ -435,11 +467,18 @@ int main(int argc, char** argv) {
             const bool left = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
             const bool right = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS ||
                                glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
+            if (views.flying != was_flying) {  // switched by V or the panel
+                set_capture(views.flying);
+                was_flying = views.flying;
+            }
             const double fly_above = ecef_to_geodetic(fly.position).height - views.eye_ground;
-            if (!io.WantCaptureMouse) {
+            if (views.mouse_captured) {
+                const double dx = mx - g_input.last_x, dy = my - g_input.last_y;
+                fly.look(dx * views.sensitivity, (views.invert_y ? dy : -dy) * views.sensitivity);
+            } else if (!io.WantCaptureMouse) {
                 const double dx = mx - g_input.last_x, dy = my - g_input.last_y;
                 if (views.flying) {
-                    if ((left && g_input.dragging_left) || (right && g_input.dragging_right)) fly.look(dx * 0.15, -dy * 0.15);
+                    if (left && !g_input.dragging_left) set_capture(true);  // click the view: mouse look
                 } else {
                     if (left && g_input.dragging_left) cam.pan_pixels(dx, dy, win_h);
                     if (right && g_input.dragging_right) cam.rotate(dx * 0.25, -dy * 0.25);
@@ -449,6 +488,7 @@ int main(int argc, char** argv) {
             } else {
                 g_input.dragging_left = g_input.dragging_right = false;
             }
+            if (views.mouse_captured) glfwGetCursorPos(window, &mx, &my);  // set_capture may have reset it
             g_input.last_x = mx;
             g_input.last_y = my;
             if (g_input.scroll != 0.0) {
@@ -470,7 +510,11 @@ int main(int argc, char** argv) {
                     const double side = (down(GLFW_KEY_D) ? 1.0 : 0.0) - (down(GLFW_KEY_A) ? 1.0 : 0.0);
                     const double rise = (down(GLFW_KEY_E) || down(GLFW_KEY_SPACE) ? 1.0 : 0.0) -
                                         (down(GLFW_KEY_Q) || down(GLFW_KEY_C) ? 1.0 : 0.0);
-                    if (ahead != 0.0 || side != 0.0 || rise != 0.0) fly.move(ahead, side, rise, speed, dt);
+                    if (views.walk) {
+                        if (ahead != 0.0 || side != 0.0) fly.move(ahead, side, 0.0, speed, dt, true);
+                    } else if (ahead != 0.0 || side != 0.0 || rise != 0.0) {
+                        fly.move(ahead, side, rise, speed, dt);
+                    }
                     const double turn = 60.0 * dt;
                     if (down(GLFW_KEY_LEFT)) fly.look(-turn, 0);
                     if (down(GLFW_KEY_RIGHT)) fly.look(turn, 0);
@@ -498,7 +542,19 @@ int main(int argc, char** argv) {
                 const bool h = down(GLFW_KEY_H);
                 if (h && !h_was_down) show_ui = !show_ui;
                 h_was_down = h;
-                if (down(GLFW_KEY_ESCAPE)) glfwSetWindowShouldClose(window, GLFW_TRUE);
+                const bool tab = down(GLFW_KEY_TAB), gk = down(GLFW_KEY_G), esc = down(GLFW_KEY_ESCAPE);
+                if (views.flying && tab && !tab_was_down) set_capture(!views.mouse_captured);
+                if (views.flying && gk && !g_was_down) views.walk = !views.walk;
+                if (esc && !esc_was_down) {
+                    if (views.mouse_captured) {
+                        set_capture(false);
+                    } else if (!views.flying) {
+                        glfwSetWindowShouldClose(window, GLFW_TRUE);
+                    }
+                }
+                tab_was_down = tab;
+                g_was_down = gk;
+                esc_was_down = esc;
             }
 
             // Terrain.
@@ -517,7 +573,14 @@ int main(int argc, char** argv) {
                 }
             }
             const Geodetic eye_geo = ecef_to_geodetic(rc.position);
-            if (const auto g = ground_height(draw, eye_geo.lat, eye_geo.lon, res)) views.eye_ground = *g * settings.exaggeration;
+            if (const auto g = ground_height(draw, eye_geo.lat, eye_geo.lon, res)) {
+                views.eye_ground = *g * settings.exaggeration;
+                if (views.flying && views.walk) {
+                    // Follow the ground quickly but smoothly (tiles refine under the eye).
+                    const double target = views.eye_ground + views.walk_height;
+                    fly.set_height(eye_geo.height + (target - eye_geo.height) * std::min(1.0, 15.0 * dt));
+                }
+            }
 
             renderer.draw(draw, rc, fb_w, fb_h, settings);
 
@@ -525,6 +588,25 @@ int main(int argc, char** argv) {
             ImGui_ImplGlfw_NewFrame();
             ImGui::NewFrame();
             ui(views, *terrain, renderer, settings, selection, args, fps, show_ui);
+            if (views.flying) {
+                ImDrawList* fg = ImGui::GetForegroundDrawList();
+                const ImVec2 c(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+                const char* hint = views.mouse_captured
+                                       ? (views.walk ? "Walking - WASD move, Shift run, G fly, Esc/Tab release mouse"
+                                                     : "Free fly - WASD move, E/Q up/down, G walk, Esc/Tab release mouse")
+                                       : "Click the view or press Tab for mouse look";
+                const ImVec2 ts = ImGui::CalcTextSize(hint);
+                fg->AddRectFilled(ImVec2(c.x - ts.x * 0.5f - 8, 8), ImVec2(c.x + ts.x * 0.5f + 8, 16 + ts.y),
+                                  IM_COL32(0, 0, 0, 140), 4.0f);
+                fg->AddText(ImVec2(c.x - ts.x * 0.5f, 12), IM_COL32(255, 255, 255, 230), hint);
+                if (views.mouse_captured) {  // crosshair
+                    const ImU32 col = IM_COL32(255, 255, 255, 200);
+                    fg->AddLine(ImVec2(c.x - 9, c.y), ImVec2(c.x - 3, c.y), col, 1.5f);
+                    fg->AddLine(ImVec2(c.x + 3, c.y), ImVec2(c.x + 9, c.y), col, 1.5f);
+                    fg->AddLine(ImVec2(c.x, c.y - 9), ImVec2(c.x, c.y - 3), col, 1.5f);
+                    fg->AddLine(ImVec2(c.x, c.y + 3), ImVec2(c.x, c.y + 9), col, 1.5f);
+                }
+            }
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 

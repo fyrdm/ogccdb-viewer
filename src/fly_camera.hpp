@@ -18,8 +18,11 @@ struct FlyCamera {
     /// Speed in m/s at a height above (or below) the ground.
     double speed(double height_above_ground) const;
     /// Moves along the view (`ahead`), sideways (`side`) and the local vertical
-    /// (`rise`), each in -1..1 times `speed` for `dt` seconds.
-    void move(double ahead, double side, double rise, double speed, double dt);
+    /// (`rise`), each in -1..1 times `speed` for `dt` seconds. With `level`,
+    /// `ahead` follows the heading only, so looking up or down does not climb.
+    void move(double ahead, double side, double rise, double speed, double dt, bool level = false);
+    /// Sets the height above the ellipsoid, keeping latitude and longitude.
+    void set_height(double height);
     void look(double dheading, double dpitch);
     void clamp();
 };
