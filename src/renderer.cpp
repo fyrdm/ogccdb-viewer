@@ -195,6 +195,18 @@ void main() {
 }
 )";
 
+// Lines (flight path, vehicle): eye-relative positions, one colour.
+const char* kLineVs = R"(#version 330 core
+layout(location = 0) in vec3 a_rel;
+uniform mat4 u_vp;
+void main() { gl_Position = u_vp * vec4(a_rel, 1.0); }
+)";
+const char* kLineFs = R"(#version 330 core
+uniform vec4 u_color;
+out vec4 frag;
+void main() { frag = u_color; }
+)";
+
 constexpr int kSurfaceRings = 96;
 constexpr int kSurfaceSegments = 160;
 constexpr int kSurfaceFloats = 10;  // eye-relative position 3, up 3, lat/lon 2, wave plane 2
@@ -235,6 +247,14 @@ std::array<float, 3> lod_color(int lod) {
 Renderer::Renderer() {
     terrain_program_ = make_program(kTerrainVs, kTerrainFs);
     surface_program_ = make_program(kSurfaceVs, kSurfaceFs);
+    line_program_ = make_program(kLineVs, kLineFs);
+    gl::GenVertexArrays(1, &line_vao_);
+    gl::BindVertexArray(line_vao_);
+    gl::GenBuffers(1, &line_vbo_);
+    gl::BindBuffer(GL_ARRAY_BUFFER, line_vbo_);
+    gl::EnableVertexAttribArray(0);
+    gl::VertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
+    gl::BindVertexArray(0);
 
     if (gl::has_extension("GL_EXT_texture_filter_anisotropic") || gl::has_extension("GL_ARB_texture_filter_anisotropic")) {
         gl::GetFloatv(kMaxTextureMaxAnisotropy, &max_anisotropy_);
@@ -282,6 +302,9 @@ Renderer::~Renderer() {
     gl::DeleteBuffers(1, &surface_ibo_);
     gl::DeleteProgram(terrain_program_);
     gl::DeleteProgram(surface_program_);
+    gl::DeleteVertexArrays(1, &line_vao_);
+    gl::DeleteBuffers(1, &line_vbo_);
+    gl::DeleteProgram(line_program_);
 }
 
 Renderer::GpuTile Renderer::upload(const TerrainTile& t) {
@@ -436,6 +459,42 @@ void Renderer::draw_surface(const Camera& camera, const RenderSettings& settings
     if (!settings.sea) gl::DepthMask(GL_FALSE);
     gl::DrawElements(GL_TRIANGLES, surface_index_count_, GL_UNSIGNED_INT, nullptr);
     gl::DepthMask(GL_TRUE);
+    gl::BindVertexArray(0);
+}
+
+void Renderer::draw_lines(const std::vector<Vec3d>& points, GLenum mode, const float rgba[4], const Camera& camera,
+                          float hidden_alpha) {
+    if (points.size() < 2) return;
+    line_vertices_.resize(points.size() * 3);
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        const Vec3d r = points[i] - camera.position;  // eye-relative in double, then float
+        line_vertices_[i * 3] = static_cast<float>(r.x);
+        line_vertices_[i * 3 + 1] = static_cast<float>(r.y);
+        line_vertices_[i * 3 + 2] = static_cast<float>(r.z);
+    }
+    const auto vp = to_float(camera.projection() * look_at_direction({0, 0, 0}, camera.direction, camera.up));
+    gl::UseProgram(line_program_);
+    gl::UniformMatrix4fv(gl::GetUniformLocation(line_program_, "u_vp"), 1, GL_FALSE, vp.data());
+    const GLint color = gl::GetUniformLocation(line_program_, "u_color");
+    gl::BindVertexArray(line_vao_);
+    gl::BindBuffer(GL_ARRAY_BUFFER, line_vbo_);
+    gl::BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(line_vertices_.size() * sizeof(float)),
+                   line_vertices_.data(), GL_STREAM_DRAW);
+    gl::Enable(GL_BLEND);
+    gl::BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    gl::Enable(GL_DEPTH_TEST);
+    gl::DepthMask(GL_FALSE);
+    const auto n = static_cast<GLsizei>(points.size());
+    if (hidden_alpha > 0.0f) {  // the parts behind terrain, faint
+        gl::DepthFunc(GL_GREATER);
+        gl::Uniform4f(color, rgba[0], rgba[1], rgba[2], rgba[3] * hidden_alpha);
+        gl::DrawArrays(mode, 0, n);
+    }
+    gl::DepthFunc(GL_LEQUAL);
+    gl::Uniform4f(color, rgba[0], rgba[1], rgba[2], rgba[3]);
+    gl::DrawArrays(mode, 0, n);
+    gl::DepthMask(GL_TRUE);
+    gl::Disable(GL_BLEND);
     gl::BindVertexArray(0);
 }
 

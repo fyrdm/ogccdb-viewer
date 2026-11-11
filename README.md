@@ -9,7 +9,7 @@ GLFW and Dear ImGui. All CDB logic (LOD selection, tile loading, meshes) lives i
 ## Build (Ubuntu/Debian)
 
 ```bash
-scripts/setup-ubuntu.sh     # once: GLFW and OpenGL headers (sudo)
+scripts/setup-ubuntu.sh     # once: GLFW, OpenGL and SQLite headers (sudo)
 scripts/build-all.sh        # builds core, runtime and viewer from sibling clones
 ```
 
@@ -22,7 +22,8 @@ cmake -B build -S . -G Ninja -DCMAKE_PREFIX_PATH=$HOME/ogccdb-prefix
 cmake --build build
 ```
 
-Dear ImGui (v1.91.9) and stb (pinned commit) are fetched at configure time.
+Dear ImGui (v1.91.9) and stb (pinned commit) are fetched at configure time. SQLite is needed
+for `.db3` bags; zstd and lz4 are optional and only needed for compressed MCAP bags.
 
 ## Run
 
@@ -90,3 +91,54 @@ The panel shows the store, camera, render options (imagery, lighting, haze, wire
 colours, sea and graticule, vertical exaggeration, screen-space error, max LOD) and streaming statistics.
 
 `--help` lists all options.
+
+## Flight playback (ROS 2 bags)
+
+The viewer plays back a drone flight recorded as a ROS 2 bag, and can look through a camera
+mounted under the drone.
+
+```bash
+build-release/ogccdb-viewer <cdb> --bag ~/bags/nav_data               # a bag folder, .mcap or .db3
+build-release/ogccdb-viewer <cdb> --bag ~/bags                        # a folder of bags: pick one
+build-release/ogccdb-viewer <cdb> --bag ~/bags/nav_data --bag-time 90 --play --speed 4
+```
+
+**Open bag...** in the panel browses for a bag. A bag is a folder with `metadata.yaml` and
+`.mcap` or `.db3` files (rosbag2's MCAP and SQLite storage), or one such file. ROS is not
+needed: the bag is read directly and its CDR messages decoded.
+
+Messages used (one topic of each is picked automatically; `ogccdb-bag-info` shows the choice):
+
+| Message | Used for |
+| --- | --- |
+| `sensor_msgs/NavSatFix` | geodetic position (ellipsoid height) |
+| `geometry_msgs/PoseStamped`, `PoseWithCovarianceStamped`, `nav_msgs/Odometry` | local position (ENU) and attitude |
+| `sensor_msgs/Imu`, `geometry_msgs/QuaternionStamped` | attitude, if there is no pose |
+| `geographic_msgs/GeoPoseStamped` | position and attitude |
+
+Attitude is a quaternion from the body frame (x forward, y left, z up) to the local ENU
+frame. With a local pose the track uses it (smooth, high rate) and anchors it to the fixes
+(the median offset between the two); otherwise it uses the fixes alone. Between messages,
+position is interpolated linearly and attitude by slerp.
+
+| Flight panel / keys | |
+| --- | --- |
+| P | play / pause (speed 0.1–32x, loop, time slider) |
+| B | drone camera on / off |
+| Left / Right | seek 5 s back / forward (drone camera) |
+| Camera tilt | -90° straight down (default), 0° forward; `--camera-tilt` |
+| Path / Follow | draw the track (flown part bright) / keep the orbit centred on the drone |
+
+The drone camera sits under the drone, aligned with its body: image up is the drone's nose,
+and the picture rolls and pitches with it. It uses the panel's field of view. Outside the
+drone camera the drone is drawn as a small cross with a red nose, with the camera's footprint
+on the ground. The panel shows position, height above ground, heading/pitch/roll, speeds and,
+per topic, the messages played so far and their rate.
+
+**Altitude** decides how flight heights meet the terrain: *As recorded*; *Start on ground*
+(shift all heights so the first pose sits on the terrain, chosen automatically when the flight
+starts at rest, because a GNSS height and the terrain's height model often disagree by tens
+or hundreds of metres); or a manual *Offset*.
+
+`ogccdb-bag-info <bag> [seconds...]` prints the bag's topics, the track it builds and the pose
+at the given times.
