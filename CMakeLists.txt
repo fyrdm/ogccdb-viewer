@@ -12,6 +12,7 @@ endif()
 
 find_package(ogccdb-runtimepublisher 0.1 CONFIG REQUIRED)
 find_package(glfw3 3.3 CONFIG REQUIRED)
+find_package(GDAL REQUIRED)  # geoid heights for the sea surface (through PROJ)
 
 # OpenGL headers only: functions are loaded at run time (src/gl.cpp).
 find_path(OGCCDB_GLCOREARB_DIR GL/glcorearb.h REQUIRED)
@@ -46,11 +47,12 @@ add_executable(ogccdb-viewer
   src/shader.cpp
   src/globe_camera.cpp
   src/fly_camera.cpp
+  src/geoid.cpp
   src/renderer.cpp
   src/screenshot.cpp
 )
 target_include_directories(ogccdb-viewer SYSTEM PRIVATE ${OGCCDB_GLCOREARB_DIR} ${stb_SOURCE_DIR})
-target_link_libraries(ogccdb-viewer PRIVATE ogccdb::runtime imgui glfw)
+target_link_libraries(ogccdb-viewer PRIVATE ogccdb::runtime GDAL::GDAL imgui glfw)
 target_compile_options(ogccdb-viewer PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>
   $<$<CXX_COMPILER_ID:MSVC>:/W4>

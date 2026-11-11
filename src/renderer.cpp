@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 
 #include "ogccdb/runtime/geodesy.hpp"
@@ -72,33 +73,78 @@ void main() {
 }
 )";
 
-const char* kGlobeVs = R"(#version 330 core
-layout(location = 0) in vec3 a_position;
-layout(location = 1) in vec2 a_latlon;
-uniform mat4 u_mvp;
+// Reference surface: vertices are already relative to the eye (computed in
+// double precision on the CPU), so it is exact near the ground too.
+const char* kSurfaceVs = R"(#version 330 core
+layout(location = 0) in vec3 a_rel;
+layout(location = 1) in vec3 a_up;
+layout(location = 2) in vec2 a_latlon;
+uniform mat4 u_vp;
+out vec3 v_rel;
+out vec3 v_up;
 out vec2 v_latlon;
 void main() {
-    gl_Position = u_mvp * vec4(a_position, 1.0);
+    gl_Position = u_vp * vec4(a_rel, 1.0);
+    v_rel = a_rel;
+    v_up = a_up;
     v_latlon = a_latlon;
 }
 )";
 
-const char* kGlobeFs = R"(#version 330 core
+const char* kSurfaceFs = R"(#version 330 core
+in vec3 v_rel;
+in vec3 v_up;
 in vec2 v_latlon;
-uniform vec3 u_color;
-uniform vec3 u_line_color;
+uniform int u_sea;
+uniform int u_graticule;
+uniform vec3 u_light;
+uniform vec3 u_sky;
+uniform float u_haze_distance;
+uniform float u_time;
 out vec4 frag;
 float grid(vec2 coord, float spacing) {
     vec2 g = abs(fract(coord / spacing - 0.5) - 0.5) / fwidth(coord / spacing);
     return 1.0 - min(min(g.x, g.y), 1.0);
 }
 void main() {
-    // 1-degree lines fade out where they would crowd the screen.
-    float fine = 1.0 - smoothstep(0.05, 0.15, max(fwidth(v_latlon.x), fwidth(v_latlon.y)));
-    float l = max(grid(v_latlon, 10.0), 0.5 * fine * grid(v_latlon, 1.0));
-    frag = vec4(mix(u_color, u_line_color, l), 1.0);
+    vec3 n = normalize(v_up);
+    float dist = length(v_rel);
+    vec3 c;
+    if (u_sea != 0) {
+        // Small moving waves, fading with distance so they never alias.
+        vec3 e = normalize(cross(vec3(0.0, 0.0, 1.0), n) + vec3(1e-6, 0.0, 0.0));
+        vec3 nn = cross(n, e);
+        vec2 m = vec2(v_latlon.y * 111320.0 * cos(radians(v_latlon.x)), v_latlon.x * 110540.0);
+        float k1 = 6.2831 / 37.0, k2 = 6.2831 / 23.0;
+        float dx = 0.6 * cos(m.x * k1 + m.y * 0.3 * k1 + u_time * 1.3) + 0.4 * cos(m.x * 0.5 * k2 - m.y * k2 + u_time * 1.9);
+        float dy = 0.6 * cos(m.y * k1 - m.x * 0.2 * k1 + u_time * 1.1) + 0.4 * cos(m.y * 0.7 * k2 + m.x * k2 + u_time * 1.7);
+        float amp = 0.06 * exp(-dist / 4000.0);
+        vec3 w = normalize(n + (e * dx + nn * dy) * amp);
+        vec3 view = normalize(-v_rel);
+        float fres = 0.04 + 0.96 * pow(1.0 - max(dot(w, view), 0.0), 5.0);
+        vec3 deep = vec3(0.03, 0.12, 0.20);
+        c = mix(deep, u_sky * 0.95, clamp(fres, 0.0, 1.0));
+        vec3 h = normalize(u_light + view);
+        c += vec3(1.0, 0.97, 0.9) * pow(max(dot(w, h), 0.0), 180.0) * 0.6;
+    } else {
+        c = vec3(0.10, 0.16, 0.24);
+    }
+    if (u_graticule != 0) {
+        // 1-degree lines fade out where they would crowd the screen.
+        float fine = 1.0 - smoothstep(0.05, 0.15, max(fwidth(v_latlon.x), fwidth(v_latlon.y)));
+        float l = max(grid(v_latlon, 10.0), 0.5 * fine * grid(v_latlon, 1.0));
+        c = mix(c, vec3(0.55, 0.65, 0.75), l * (u_sea != 0 ? 0.35 : 1.0));
+    }
+    if (u_haze_distance > 0.0) {
+        float f = 1.0 - exp(-dist / u_haze_distance);
+        c = mix(c, u_sky, clamp(f, 0.0, 0.85));
+    }
+    frag = vec4(c, 1.0);
 }
 )";
+
+constexpr int kSurfaceRings = 96;
+constexpr int kSurfaceSegments = 160;
 
 std::array<float, 16> to_float(const Mat4d& m) {
     std::array<float, 16> f{};
@@ -130,56 +176,52 @@ std::array<float, 3> lod_color(int lod) {
 
 Renderer::Renderer() {
     terrain_program_ = make_program(kTerrainVs, kTerrainFs);
-    globe_program_ = make_program(kGlobeVs, kGlobeFs);
+    surface_program_ = make_program(kSurfaceVs, kSurfaceFs);
 
     if (gl::has_extension("GL_EXT_texture_filter_anisotropic") || gl::has_extension("GL_ARB_texture_filter_anisotropic")) {
         gl::GetFloatv(kMaxTextureMaxAnisotropy, &max_anisotropy_);
     }
 
-    // Background globe: the WGS-84 ellipsoid 50 m down, so terrain at sea level stays on top.
-    const int stacks = 90, slices = 180;
-    std::vector<float> v;
+    // Reference surface: a centre vertex below the eye and rings around it out
+    // to the horizon. Positions change every frame; the triangles do not.
     std::vector<std::uint32_t> idx;
-    for (int i = 0; i <= stacks; ++i) {
-        const double lat = -90.0 + 180.0 * i / stacks;
-        for (int j = 0; j <= slices; ++j) {
-            const double lon = -180.0 + 360.0 * j / slices;
-            const Vec3d p = geodetic_to_ecef({lat, lon, -50.0});
-            v.insert(v.end(), {static_cast<float>(p.x), static_cast<float>(p.y), static_cast<float>(p.z),
-                               static_cast<float>(lat), static_cast<float>(lon)});
+    const std::uint32_t segs = kSurfaceSegments;
+    for (std::uint32_t j = 0; j < segs; ++j) idx.insert(idx.end(), {0u, 1 + j, 1 + (j + 1) % segs});
+    for (std::uint32_t i = 0; i + 1 < static_cast<std::uint32_t>(kSurfaceRings); ++i) {
+        for (std::uint32_t j = 0; j < segs; ++j) {
+            const std::uint32_t a0 = 1 + i * segs + j, a1 = 1 + i * segs + (j + 1) % segs;
+            const std::uint32_t b0 = a0 + segs, b1 = a1 + segs;
+            idx.insert(idx.end(), {a0, b0, a1, a1, b0, b1});
         }
     }
-    for (int i = 0; i < stacks; ++i) {
-        for (int j = 0; j < slices; ++j) {
-            const std::uint32_t a = static_cast<std::uint32_t>(i * (slices + 1) + j);
-            const std::uint32_t b = a + 1, c = a + static_cast<std::uint32_t>(slices + 1), d = c + 1;
-            idx.insert(idx.end(), {a, b, c, b, d, c});
-        }
-    }
-    globe_index_count_ = static_cast<GLsizei>(idx.size());
-    gl::GenVertexArrays(1, &globe_vao_);
-    gl::BindVertexArray(globe_vao_);
-    gl::GenBuffers(1, &globe_vbo_);
-    gl::BindBuffer(GL_ARRAY_BUFFER, globe_vbo_);
-    gl::BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(v.size() * sizeof(float)), v.data(), GL_STATIC_DRAW);
-    gl::GenBuffers(1, &globe_ibo_);
-    gl::BindBuffer(GL_ELEMENT_ARRAY_BUFFER, globe_ibo_);
+    surface_index_count_ = static_cast<GLsizei>(idx.size());
+    gl::GenVertexArrays(1, &surface_vao_);
+    gl::BindVertexArray(surface_vao_);
+    gl::GenBuffers(1, &surface_vbo_);
+    gl::BindBuffer(GL_ARRAY_BUFFER, surface_vbo_);
+    gl::BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>((1 + kSurfaceRings * kSurfaceSegments) * 8 * sizeof(float)),
+                   nullptr, GL_STREAM_DRAW);
+    gl::GenBuffers(1, &surface_ibo_);
+    gl::BindBuffer(GL_ELEMENT_ARRAY_BUFFER, surface_ibo_);
     gl::BufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(idx.size() * sizeof(std::uint32_t)), idx.data(),
                    GL_STATIC_DRAW);
+    const GLsizei stride = 8 * sizeof(float);
     gl::EnableVertexAttribArray(0);
-    gl::VertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), nullptr);
+    gl::VertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, nullptr);
     gl::EnableVertexAttribArray(1);
-    gl::VertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), reinterpret_cast<void*>(3 * sizeof(float)));
+    gl::VertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(3 * sizeof(float)));
+    gl::EnableVertexAttribArray(2);
+    gl::VertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(6 * sizeof(float)));
     gl::BindVertexArray(0);
 }
 
 Renderer::~Renderer() {
     for (auto& [t, g] : tiles_) release(g);
-    gl::DeleteVertexArrays(1, &globe_vao_);
-    gl::DeleteBuffers(1, &globe_vbo_);
-    gl::DeleteBuffers(1, &globe_ibo_);
+    gl::DeleteVertexArrays(1, &surface_vao_);
+    gl::DeleteBuffers(1, &surface_vbo_);
+    gl::DeleteBuffers(1, &surface_ibo_);
     gl::DeleteProgram(terrain_program_);
-    gl::DeleteProgram(globe_program_);
+    gl::DeleteProgram(surface_program_);
 }
 
 Renderer::GpuTile Renderer::upload(const TerrainTile& t) {
@@ -249,18 +291,68 @@ void Renderer::release(GpuTile& g) {
     g = GpuTile{};
 }
 
-void Renderer::draw_globe(const Camera& camera, const RenderSettings& settings) {
-    if (!settings.globe) return;
+void Renderer::draw_surface(const Camera& camera, const RenderSettings& settings, const float sky[3], double haze,
+                            Vec3d light) {
+    // Without the sea, a dark background globe 50 m down (no depth), as before.
+    const double k = settings.exaggeration;
+    auto level_at = [&](double lat, double lon) {
+        if (!settings.sea) return -50.0;
+        return settings.sea_height ? settings.sea_height(lat, lon) * k : 0.0;
+    };
+    const Geodetic eye = ecef_to_geodetic(camera.position);
+    const double level = level_at(eye.lat, eye.lon);
+    const double alt = std::max(eye.height - level, 1.0);
+    const double r = kWgs84A;
+    // Rings by angle from the point below the eye, spaced geometrically out to
+    // just past the horizon, so spacing grows with distance like the detail needed.
+    const double horizon = std::acos(r / (r + alt));
+    const double t_max = std::min(horizon * 1.05 + 1e-4, 1.45);
+    const double t_min = std::clamp(alt * 0.02 / r, 1e-9, t_max / 50.0);
+    const Vec3d e = local_east(eye.lat, eye.lon), n = local_north(eye.lat, eye.lon);
+    const Vec3d nadir = geodetic_to_ecef({eye.lat, eye.lon, level});
+
+    surface_vertices_.clear();
+    surface_vertices_.reserve(static_cast<std::size_t>(1 + kSurfaceRings * kSurfaceSegments) * 8);
+    auto push = [&](double lat, double lon) {
+        const Vec3d p = geodetic_to_ecef({lat, lon, level_at(lat, lon)}) - camera.position;
+        const Vec3d up = ellipsoid_up(lat, lon);
+        surface_vertices_.insert(surface_vertices_.end(),
+                                 {static_cast<float>(p.x), static_cast<float>(p.y), static_cast<float>(p.z),
+                                  static_cast<float>(up.x), static_cast<float>(up.y), static_cast<float>(up.z),
+                                  static_cast<float>(lat), static_cast<float>(lon)});
+    };
+    push(eye.lat, eye.lon);
+    for (int i = 0; i < kSurfaceRings; ++i) {
+        const double t = t_min * std::pow(t_max / t_min, static_cast<double>(i) / (kSurfaceRings - 1));
+        const double d = r * std::tan(t);  // on the tangent plane below the eye
+        for (int j = 0; j < kSurfaceSegments; ++j) {
+            const double az = 2.0 * kPi * j / kSurfaceSegments;
+            const Geodetic g = ecef_to_geodetic(nadir + (e * std::cos(az) + n * std::sin(az)) * d);
+            push(g.lat, g.lon);
+        }
+    }
+
     const Mat4d rot = look_at_direction({0, 0, 0}, camera.direction, camera.up);
-    const auto mvp = to_float(camera.projection() * rot * translation(-camera.position));
-    gl::UseProgram(globe_program_);
-    gl::UniformMatrix4fv(gl::GetUniformLocation(globe_program_, "u_mvp"), 1, GL_FALSE, mvp.data());
-    gl::Uniform3f(gl::GetUniformLocation(globe_program_, "u_color"), 0.10f, 0.16f, 0.24f);
-    gl::Uniform3f(gl::GetUniformLocation(globe_program_, "u_line_color"), 0.30f, 0.40f, 0.52f);
-    gl::DepthMask(GL_FALSE);  // background only: terrain always draws over it
-    gl::BindVertexArray(globe_vao_);
-    gl::DrawElements(GL_TRIANGLES, globe_index_count_, GL_UNSIGNED_INT, nullptr);
+    const auto vp = to_float(camera.projection() * rot);
+    gl::UseProgram(surface_program_);
+    gl::UniformMatrix4fv(gl::GetUniformLocation(surface_program_, "u_vp"), 1, GL_FALSE, vp.data());
+    gl::Uniform1i(gl::GetUniformLocation(surface_program_, "u_sea"), settings.sea ? 1 : 0);
+    gl::Uniform1i(gl::GetUniformLocation(surface_program_, "u_graticule"), settings.graticule ? 1 : 0);
+    gl::Uniform3f(gl::GetUniformLocation(surface_program_, "u_light"), static_cast<float>(light.x),
+                  static_cast<float>(light.y), static_cast<float>(light.z));
+    gl::Uniform3f(gl::GetUniformLocation(surface_program_, "u_sky"), sky[0], sky[1], sky[2]);
+    gl::Uniform1f(gl::GetUniformLocation(surface_program_, "u_haze_distance"), static_cast<float>(haze));
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    gl::Uniform1f(gl::GetUniformLocation(surface_program_, "u_time"), static_cast<float>(std::fmod(seconds, 1000.0)));
+    gl::BindVertexArray(surface_vao_);
+    gl::BindBuffer(GL_ARRAY_BUFFER, surface_vbo_);
+    gl::BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(surface_vertices_.size() * sizeof(float)),
+                   surface_vertices_.data(), GL_STREAM_DRAW);
+    // The sea hides terrain below it; the background globe never does.
+    if (!settings.sea) gl::DepthMask(GL_FALSE);
+    gl::DrawElements(GL_TRIANGLES, surface_index_count_, GL_UNSIGNED_INT, nullptr);
     gl::DepthMask(GL_TRUE);
+    gl::BindVertexArray(0);
 }
 
 void Renderer::draw(const std::vector<DrawTile>& tiles, const Camera& camera, int width, int height,
@@ -282,8 +374,6 @@ void Renderer::draw(const std::vector<DrawTile>& tiles, const Camera& camera, in
     gl::DepthFunc(GL_LEQUAL);
     gl::Disable(GL_CULL_FACE);
 
-    draw_globe(camera, settings);
-
     const Mat4d rot = look_at_direction({0, 0, 0}, camera.direction, camera.up);
     const Mat4d proj = camera.projection();
     // Light from the north-west, high above the view centre.
@@ -304,6 +394,8 @@ void Renderer::draw(const std::vector<DrawTile>& tiles, const Camera& camera, in
     gl::Uniform1f(gl::GetUniformLocation(terrain_program_, "u_exaggeration"), settings.exaggeration);
     gl::Uniform3f(gl::GetUniformLocation(terrain_program_, "u_haze_color"), sky[0], sky[1], sky[2]);
     const double haze = settings.haze ? std::max(eye_height, 500.0) * 60.0 + 2.0e4 : 0.0;
+    if (!settings.sea) draw_surface(camera, settings, sky, haze, light);  // background first
+    gl::UseProgram(terrain_program_);
     gl::Uniform1f(gl::GetUniformLocation(terrain_program_, "u_haze_distance"), static_cast<float>(haze));
     gl::ActiveTexture(GL_TEXTURE0);
     if (settings.wireframe) gl::PolygonMode(GL_FRONT_AND_BACK, GL_LINE);
@@ -343,6 +435,7 @@ void Renderer::draw(const std::vector<DrawTile>& tiles, const Camera& camera, in
         stats_.triangles += static_cast<std::size_t>(gt.index_count / 3);
     }
     if (settings.wireframe) gl::PolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    if (settings.sea) draw_surface(camera, settings, sky, haze, light);  // hides terrain below sea level
     gl::BindVertexArray(0);
 
     // Drop GPU tiles not drawn for a few seconds.

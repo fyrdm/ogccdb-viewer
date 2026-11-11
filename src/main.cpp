@@ -15,6 +15,7 @@
 
 #include "gl.hpp"
 #include "fly_camera.hpp"
+#include "geoid.hpp"
 #include "globe_camera.hpp"
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -40,6 +41,8 @@ struct Args {
     double max_screen_error = 1.5;
     bool lod_colors = false;
     bool hide_ui = false;
+    std::string sea = "auto";
+    double sea_offset = 0.0;
 };
 
 void usage() {
@@ -55,6 +58,9 @@ void usage() {
         "  --exaggeration <k>          vertical exaggeration (default 1)\n"
         "  --screen-error <px>         LOD refinement threshold (default 1.5)\n"
         "  --lod-colors                tint tiles by LOD\n"
+        "  --sea <ref>                 sea surface: auto (best installed geoid, default),\n"
+        "                              egm2008, egm96, ellipsoid or off\n"
+        "  --sea-offset <m>            raise (or lower) the sea above its reference\n"
         "  --size <w>x<h>              window size (default 1600x1000)\n"
         "  --screenshot <file.png>     render until all tiles are loaded, save, exit\n"
         "  --no-ui                     hide the panels\n"
@@ -91,6 +97,15 @@ std::optional<Args> parse(int argc, char** argv) {
         else if (s == "--screen-error") { const char* v = next(); if (!v) return std::nullopt; a.max_screen_error = std::atof(v); }
         else if (s == "--lod-colors") a.lod_colors = true;
         else if (s == "--no-ui") a.hide_ui = true;
+        else if (s == "--sea") {
+            const char* v = next();
+            if (!v) return std::nullopt;
+            a.sea = v;
+            if (a.sea != "auto" && a.sea != "egm2008" && a.sea != "egm96" && a.sea != "ellipsoid" && a.sea != "off") {
+                std::fprintf(stderr, "--sea takes auto, egm2008, egm96, ellipsoid or off\n");
+                return std::nullopt;
+            }
+        } else if (s == "--sea-offset") { const char* v = next(); if (!v) return std::nullopt; a.sea_offset = std::atof(v); }
         else if (s == "--size") {
             const char* v = next();
             if (!v || std::sscanf(v, "%dx%d", &a.width, &a.height) != 2) return std::nullopt;
@@ -145,6 +160,37 @@ void fit_store(GlobeCamera& cam, const TileIndex& index) {
     cam.heading = 0.0;
     cam.pitch = -60.0;
 }
+
+/// The imaginary sea: a reference surface (geoid or ellipsoid) that runs on
+/// under the terrain, like mean sea level in geodesy, plus an offset.
+struct Sea {
+    enum Reference { Auto, Egm2008, Egm96, Ellipsoid };
+    Reference reference = Auto;
+    float offset = 0.0f;  ///< metres above the reference (raise it to flood)
+    Geoid egm2008{3855}, egm96{5773};
+
+    /// The geoid in use, or nullptr for the ellipsoid.
+    Geoid* geoid() {
+        switch (reference) {
+            case Auto: return egm2008.available() ? &egm2008 : egm96.available() ? &egm96 : nullptr;
+            case Egm2008: return egm2008.available() ? &egm2008 : nullptr;
+            case Egm96: return egm96.available() ? &egm96 : nullptr;
+            case Ellipsoid: return nullptr;
+        }
+        return nullptr;
+    }
+    const char* name(const Geoid* g) const {
+        return g == &egm2008 ? "geoid EGM2008" : g == &egm96 ? "geoid EGM96" : "ellipsoid";
+    }
+    /// Sea height above the ellipsoid in metres.
+    static double height(Geoid* g, float offset, double lat, double lon) {
+        double n = 0.0;
+        if (g) {
+            if (const auto h = g->height(lat, lon)) n = *h;
+        }
+        return n + offset;
+    }
+};
 
 /// Both cameras; one of them drives the view.
 struct Views {
@@ -214,7 +260,7 @@ void scroll_callback(GLFWwindow* w, double xoff, double yoff) {
     if (!ImGui::GetIO().WantCaptureMouse) g_input.scroll += yoff;
 }
 
-void ui(Views& v, Terrain& terrain, Renderer& renderer, RenderSettings& settings, SelectionOptions& sel,
+void ui(Views& v, Terrain& terrain, Renderer& renderer, RenderSettings& settings, SelectionOptions& sel, Sea& sea,
         const Args& args, double fps, bool& show_ui) {
     if (!show_ui) return;
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
@@ -306,8 +352,31 @@ void ui(Views& v, Terrain& terrain, Renderer& renderer, RenderSettings& settings
         ImGui::Checkbox("Wireframe", &settings.wireframe);
         ImGui::SameLine();
         ImGui::Checkbox("LOD colours", &settings.lod_colors);
+        ImGui::Checkbox("Sea", &settings.sea);
         ImGui::SameLine();
-        ImGui::Checkbox("Globe", &settings.globe);
+        ImGui::Checkbox("Graticule", &settings.graticule);
+        if (settings.sea) {
+            int ref = sea.reference;
+            ImGui::Combo("Sea reference", &ref, "Geoid, best installed\0Geoid EGM2008\0Geoid EGM96\0Ellipsoid\0");
+            sea.reference = static_cast<Sea::Reference>(ref);
+            Geoid* g = sea.geoid();
+            const Geodetic at = v.flying ? ecef_to_geodetic(v.fly.position) : Geodetic{v.orbit.lat, v.orbit.lon, 0.0};
+            const double h = Sea::height(g, sea.offset, at.lat, at.lon);
+            ImGui::Text("Using the %s: sea at %.1f m here", sea.name(g), h);
+            if ((sea.reference == Sea::Egm2008 || sea.reference == Sea::Auto) && !sea.egm2008.available()) {
+                ImGui::TextDisabled("EGM2008: %s", sea.egm2008.error().c_str());
+            }
+            if (sea.reference == Sea::Egm96 && !sea.egm96.available()) {
+                ImGui::TextDisabled("EGM96: %s", sea.egm96.error().c_str());
+            }
+            ImGui::DragFloat("Sea offset", &sea.offset, 1.0f, -1000.0f, 9000.0f, "%+.0f m");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("0")) sea.offset = 0.0f;
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            ImGui::TextWrapped("Use the geoid if the store holds ellipsoid heights, the ellipsoid if it holds "
+                               "heights above sea level. Raise the offset to flood the terrain.");
+            ImGui::PopStyleColor();
+        }
         ImGui::SliderFloat("Exaggeration", &settings.exaggeration, 1.0f, 5.0f, "%.1fx");
         float err = static_cast<float>(sel.max_screen_error);
         if (ImGui::SliderFloat("Screen error", &err, 0.5f, 16.0f, "%.1f px", ImGuiSliderFlags_Logarithmic)) {
@@ -414,6 +483,17 @@ int main(int argc, char** argv) {
         RenderSettings settings;
         settings.exaggeration = args.exaggeration;
         settings.lod_colors = args.lod_colors;
+        Sea sea;
+        settings.sea = args.sea != "off";
+        if (args.sea == "egm2008") sea.reference = Sea::Egm2008;
+        if (args.sea == "egm96") sea.reference = Sea::Egm96;
+        if (args.sea == "ellipsoid") sea.reference = Sea::Ellipsoid;
+        sea.offset = static_cast<float>(args.sea_offset);
+        if (settings.sea) {
+            Geoid* g = sea.geoid();
+            std::printf("sea: %s%s\n", sea.name(g),
+                        sea.reference != Sea::Ellipsoid && !g ? " (no geoid grid installed)" : "");
+        }
         SelectionOptions selection = terrain->options().selection;
 
         Views views;
@@ -585,16 +665,28 @@ int main(int argc, char** argv) {
                                   : cam.to_runtime(fb_w, fb_h, ground_known ? ground : cam.height);
             const auto& draw = terrain->update(rc);
             const int res = terrain->options().mesh.resolution;
+            Geoid* const sea_geoid = sea.geoid();
+            const float sea_offset = sea.offset;
+            settings.sea_height = [sea_geoid, sea_offset](double lat, double lon) {
+                return Sea::height(sea_geoid, sea_offset, lat, lon);
+            };
+            // Ground: the terrain, or the sea where it is higher or there is no terrain.
+            auto surface = [&](double lat, double lon) -> std::optional<double> {
+                std::optional<double> h = ground_height(draw, lat, lon, res);
+                if (settings.sea) h = std::max(h.value_or(-1e9), settings.sea_height(lat, lon));
+                if (h) *h *= settings.exaggeration;
+                return h;
+            };
             if (!views.flying) {
-                if (const auto g = ground_height(draw, cam.lat, cam.lon, res)) {
-                    ground = *g * settings.exaggeration;
+                if (const auto g = surface(cam.lat, cam.lon)) {
+                    ground = *g;
                     cam.height = ground_known ? cam.height + (ground - cam.height) * std::min(1.0, 10.0 * dt) : ground;
                     ground_known = true;
                 }
             }
             const Geodetic eye_geo = ecef_to_geodetic(rc.position);
-            if (const auto g = ground_height(draw, eye_geo.lat, eye_geo.lon, res)) {
-                views.eye_ground = *g * settings.exaggeration;
+            if (const auto g = surface(eye_geo.lat, eye_geo.lon)) {
+                views.eye_ground = *g;
                 if (views.flying && views.walk) {
                     // Follow the ground quickly but smoothly (tiles refine under the eye).
                     const double target = views.eye_ground + views.walk_height;
@@ -607,7 +699,7 @@ int main(int argc, char** argv) {
             ImGui_ImplOpenGL3_NewFrame();
             ImGui_ImplGlfw_NewFrame();
             ImGui::NewFrame();
-            ui(views, *terrain, renderer, settings, selection, args, fps, show_ui);
+            ui(views, *terrain, renderer, settings, selection, sea, args, fps, show_ui);
             if (views.flying) {
                 ImDrawList* fg = ImGui::GetForegroundDrawList();
                 const ImVec2 c(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);

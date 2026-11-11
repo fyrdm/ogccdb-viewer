@@ -1,6 +1,7 @@
 #pragma once
-// Draws the runtime's terrain tiles and a background globe with OpenGL 3.3 core.
+// Draws the runtime's terrain tiles and a sea-level reference surface with OpenGL 3.3 core.
 #include <cstdint>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -13,7 +14,12 @@ struct RenderSettings {
     bool wireframe = false;
     bool lod_colors = false;
     bool haze = true;
-    bool globe = true;
+    /// Reference surface under the terrain: a sea whose height above the
+    /// ellipsoid at (lat, lon) is `sea_height` (the geoid for mean sea level;
+    /// 0 m if unset). Off: a dark globe drawn as background only.
+    bool sea = true;
+    bool graticule = true;
+    std::function<double(double lat, double lon)> sea_height;
     float exaggeration = 1.0f;
 };
 
@@ -47,12 +53,14 @@ private:
 
     GpuTile upload(const ogccdb::runtime::TerrainTile& t);
     void release(GpuTile& g);
-    void draw_globe(const ogccdb::runtime::Camera& camera, const RenderSettings& settings);
+    void draw_surface(const ogccdb::runtime::Camera& camera, const RenderSettings& settings, const float sky[3],
+                      double haze, ogccdb::runtime::Vec3d light);
 
     GLuint terrain_program_ = 0;
-    GLuint globe_program_ = 0;
-    GLuint globe_vao_ = 0, globe_vbo_ = 0, globe_ibo_ = 0;
-    GLsizei globe_index_count_ = 0;
+    GLuint surface_program_ = 0;
+    GLuint surface_vao_ = 0, surface_vbo_ = 0, surface_ibo_ = 0;
+    GLsizei surface_index_count_ = 0;
+    std::vector<float> surface_vertices_;
     float max_anisotropy_ = 0.0f;
     std::uint64_t frame_ = 0;
     std::unordered_map<ogccdb::runtime::TileAddress, GpuTile, ogccdb::runtime::TileAddressHash> tiles_;
