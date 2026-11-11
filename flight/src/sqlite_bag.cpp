@@ -7,6 +7,7 @@
 #include <sqlite3.h>
 
 #include "ogccdb/flight/bag.hpp"
+#include "storage.hpp"
 
 namespace ogccdb::flight {
 namespace {

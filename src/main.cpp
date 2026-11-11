@@ -89,7 +89,7 @@ void usage() {
         "[ ] narrow / widen the field of view\n"
         "V switches orbit / free fly, H toggles the panels\n"
         "flight playback (ROS 2 bag, MCAP or SQLite storage):\n"
-        "  --bag <folder|file.mcap|file.db3>  open a bag; a folder of bags opens the bag browser\n"
+        "  --bag <folder|.mcap|.db3|.tar>  open a bag; a folder of bags opens the bag browser\n"
         "  --bag-time <s>              start at this many seconds into the bag\n"
         "  --play [--speed <k>]        start playing (k times real time)\n"
         "  --camera-tilt <deg>         drone camera tilt from the body's forward (default -90, down)\n"

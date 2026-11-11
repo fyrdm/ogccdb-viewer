@@ -52,7 +52,7 @@ protected:
 };
 
 /// True if `path` is a bag Bag::open can read: a folder with metadata.yaml or
-/// storage files, or a .mcap or .db3 file.
+/// storage files, a .mcap or .db3 file, or an uncompressed .tar holding a bag.
 bool is_bag(const std::filesystem::path& path);
 
 }  // namespace ogccdb::flight
