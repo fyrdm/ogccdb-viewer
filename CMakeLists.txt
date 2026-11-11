@@ -45,6 +45,7 @@ add_executable(ogccdb-viewer
   src/gl.cpp
   src/shader.cpp
   src/globe_camera.cpp
+  src/fly_camera.cpp
   src/renderer.cpp
   src/screenshot.cpp
 )

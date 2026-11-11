@@ -29,15 +29,28 @@ Dear ImGui (v1.91.9) and stb (pinned commit) are fetched at configure time.
 ```bash
 build-release/ogccdb-viewer ~/ogccdb-core/out/sample/CDB
 build-release/ogccdb-viewer <cdb> --lat 47.12 --lon 8.75 --distance 25000 --pitch -18 --heading 160
+build-release/ogccdb-viewer <cdb> --fly --lat 47.1 --lon 8.62 --height 300 --pitch 25   # underground
 build-release/ogccdb-viewer <cdb> --screenshot view.png --no-ui   # render, save, exit
 ```
 
-| Input | Action |
+Two camera modes; **V** (or the panel) switches between them.
+
+| Orbit (default) | |
 | --- | --- |
 | Left drag / WASD | pan |
 | Right or middle drag / Q E R F | rotate and tilt |
 | Wheel / + - | zoom |
-| H | show or hide the panel |
+
+| Free fly | |
+| --- | --- |
+| Drag / arrow keys | look around (pitch -90..+90) |
+| W S A D | forward, back, left, right |
+| E or Space / Q or C | up / down |
+| Shift / Ctrl | 5x faster / 5x slower |
+| Wheel | speed (scales with height above ground) |
+
+Free fly goes anywhere, also below the terrain: seen from below, tiles are drawn darker
+and the skirts show as thin walls. **H** shows or hides the panel.
 
 The panel shows the store, camera, render options (imagery, lighting, haze, wireframe, LOD
 colours, vertical exaggeration, screen-space error, max LOD) and streaming statistics.

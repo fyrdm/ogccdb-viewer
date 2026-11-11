@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "gl.hpp"
+#include "fly_camera.hpp"
 #include "globe_camera.hpp"
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -31,7 +32,8 @@ namespace {
 
 struct Args {
     std::filesystem::path cdb;
-    std::optional<double> lat, lon, distance, heading, pitch;
+    std::optional<double> lat, lon, distance, heading, pitch, eye_height;
+    bool fly = false;
     int width = 1600, height = 1000;
     std::optional<std::string> screenshot;
     float exaggeration = 1.0f;
@@ -47,14 +49,19 @@ void usage() {
         "  --distance <m>              eye distance from the target\n"
         "  --heading <deg>             0 = looking north\n"
         "  --pitch <deg>               -90 = straight down (default -60)\n"
+        "  --fly                       start in free-fly mode (at the orbit eye, or at --lat --lon --height)\n"
+        "  --height <m>                free-fly eye height above the ellipsoid\n"
         "  --exaggeration <k>          vertical exaggeration (default 1)\n"
         "  --screen-error <px>         LOD refinement threshold (default 1.5)\n"
         "  --lod-colors                tint tiles by LOD\n"
         "  --size <w>x<h>              window size (default 1600x1000)\n"
         "  --screenshot <file.png>     render until all tiles are loaded, save, exit\n"
         "  --no-ui                     hide the panels\n"
-        "controls: left drag pan, right drag rotate/tilt, wheel zoom,\n"
-        "          WASD pan, Q/E rotate, R/F tilt, +/- zoom, H toggles the panels");
+        "orbit:    left drag pan, right drag rotate/tilt, wheel zoom,\n"
+        "          WASD pan, Q/E rotate, R/F tilt, +/- zoom\n"
+        "free fly: drag to look, WASD move, E/Space up, Q/C down, Shift faster,\n"
+        "          Ctrl slower, wheel sets speed, arrows look\n"
+        "V switches orbit / free fly, H toggles the panels");
 }
 
 std::optional<Args> parse(int argc, char** argv) {
@@ -74,6 +81,8 @@ std::optional<Args> parse(int argc, char** argv) {
         else if (s == "--distance") { if (!number(a.distance)) return std::nullopt; }
         else if (s == "--heading") { if (!number(a.heading)) return std::nullopt; }
         else if (s == "--pitch") { if (!number(a.pitch)) return std::nullopt; }
+        else if (s == "--height") { if (!number(a.eye_height)) return std::nullopt; }
+        else if (s == "--fly") a.fly = true;
         else if (s == "--exaggeration") { const char* v = next(); if (!v) return std::nullopt; a.exaggeration = static_cast<float>(std::atof(v)); }
         else if (s == "--screen-error") { const char* v = next(); if (!v) return std::nullopt; a.max_screen_error = std::atof(v); }
         else if (s == "--lod-colors") a.lod_colors = true;
@@ -133,6 +142,50 @@ void fit_store(GlobeCamera& cam, const TileIndex& index) {
     cam.pitch = -60.0;
 }
 
+/// Both cameras; one of them drives the view.
+struct Views {
+    GlobeCamera orbit;
+    FlyCamera fly;
+    bool flying = false;
+    double ground = 0.0;      ///< terrain height under the orbit target
+    double eye_ground = 0.0;  ///< terrain height under the free-fly eye
+};
+
+void orbit_to_fly(Views& v) {
+    v.fly.position = v.orbit.eye();
+    v.fly.heading = v.orbit.heading;
+    v.fly.pitch = v.orbit.pitch;
+    v.fly.fov_y_deg = v.orbit.fov_y_deg;
+    v.fly.clamp();
+}
+
+/// Orbit around the ground point the free-fly view looks at, or around the
+/// point below the eye when it looks up or is underground.
+void fly_to_orbit(Views& v) {
+    GlobeCamera& o = v.orbit;
+    const FlyCamera& f = v.fly;
+    const Geodetic g = ecef_to_geodetic(f.position);
+    const double above = g.height - v.eye_ground;
+    o.heading = f.heading;
+    o.fov_y_deg = f.fov_y_deg;
+    if (f.pitch < -5.0 && above > 1.0) {
+        const double d = above / std::sin(-f.pitch * kDegToRad);
+        const Geodetic t = ecef_to_geodetic(f.position + f.forward() * d);
+        o.lat = t.lat;
+        o.lon = t.lon;
+        o.height = t.height;
+        o.distance = d;
+        o.pitch = f.pitch;
+    } else {
+        o.lat = g.lat;
+        o.lon = g.lon;
+        o.height = v.eye_ground;
+        o.distance = std::max(std::fabs(above), 50.0) * 1.5;
+        o.pitch = -45.0;
+    }
+    o.clamp();
+}
+
 struct Input {
     bool dragging_left = false, dragging_right = false;
     double last_x = 0, last_y = 0;
@@ -145,8 +198,8 @@ void scroll_callback(GLFWwindow* w, double xoff, double yoff) {
     if (!ImGui::GetIO().WantCaptureMouse) g_input.scroll += yoff;
 }
 
-void ui(GlobeCamera& cam, Terrain& terrain, Renderer& renderer, RenderSettings& settings, SelectionOptions& sel,
-        const Args& args, double fps, double ground, bool& show_ui) {
+void ui(Views& v, Terrain& terrain, Renderer& renderer, RenderSettings& settings, SelectionOptions& sel,
+        const Args& args, double fps, bool& show_ui) {
     if (!show_ui) return;
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(360, 0), ImGuiCond_FirstUseEver);
@@ -157,17 +210,55 @@ void ui(GlobeCamera& cam, Terrain& terrain, Renderer& renderer, RenderSettings& 
     if (const auto e = idx.extent()) ImGui::Text("Extent %.0f..%.0f N, %.0f..%.0f E", e->south, e->north, e->west, e->east);
 
     if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
-        const Geodetic eye = ecef_to_geodetic(cam.eye());
-        ImGui::Text("Target %.5f, %.5f  ground %.0f m", cam.lat, cam.lon, ground);
-        ImGui::Text("Eye height %.0f m, distance %.0f m", eye.height, cam.distance);
-        float heading = static_cast<float>(cam.heading), pitch = static_cast<float>(cam.pitch);
-        if (ImGui::SliderFloat("Heading", &heading, 0.0f, 360.0f, "%.0f deg")) cam.heading = heading;
-        if (ImGui::SliderFloat("Pitch", &pitch, -89.9f, -1.0f, "%.0f deg")) cam.pitch = pitch;
-        if (ImGui::Button("Fit store")) fit_store(cam, idx);
+        int mode = v.flying ? 1 : 0;
+        ImGui::RadioButton("Orbit", &mode, 0);
         ImGui::SameLine();
-        if (ImGui::Button("Top view")) cam.pitch = -89.9;
+        ImGui::RadioButton("Free fly", &mode, 1);
         ImGui::SameLine();
-        if (ImGui::Button("North up")) cam.heading = 0.0;
+        ImGui::TextDisabled("(V)");
+        if (mode == 1 && !v.flying) {
+            orbit_to_fly(v);
+            v.flying = true;
+        } else if (mode == 0 && v.flying) {
+            fly_to_orbit(v);
+            v.flying = false;
+        }
+        if (!v.flying) {
+            GlobeCamera& cam = v.orbit;
+            const Geodetic eye = ecef_to_geodetic(cam.eye());
+            ImGui::Text("Target %.5f, %.5f  ground %.0f m", cam.lat, cam.lon, v.ground);
+            ImGui::Text("Eye height %.0f m, distance %.0f m", eye.height, cam.distance);
+            float heading = static_cast<float>(cam.heading), pitch = static_cast<float>(cam.pitch);
+            if (ImGui::SliderFloat("Heading", &heading, 0.0f, 360.0f, "%.0f deg")) cam.heading = heading;
+            if (ImGui::SliderFloat("Pitch", &pitch, -89.9f, -1.0f, "%.0f deg")) cam.pitch = pitch;
+            if (ImGui::Button("Fit store")) fit_store(cam, idx);
+            ImGui::SameLine();
+            if (ImGui::Button("Top view")) cam.pitch = -89.9;
+            ImGui::SameLine();
+            if (ImGui::Button("North up")) cam.heading = 0.0;
+        } else {
+            FlyCamera& cam = v.fly;
+            const Geodetic eye = ecef_to_geodetic(cam.position);
+            const double above = eye.height - v.eye_ground;
+            ImGui::Text("Eye %.5f, %.5f", eye.lat, eye.lon);
+            ImGui::Text("Height %.1f m, %s ground by %.1f m", eye.height, above >= 0 ? "above" : "BELOW", std::fabs(above));
+            ImGui::Text("Speed %.0f m/s", cam.speed(above));
+            float heading = static_cast<float>(cam.heading), pitch = static_cast<float>(cam.pitch);
+            float speed = static_cast<float>(cam.speed_factor);
+            if (ImGui::SliderFloat("Heading", &heading, 0.0f, 360.0f, "%.0f deg")) cam.heading = heading;
+            if (ImGui::SliderFloat("Pitch", &pitch, -89.9f, 89.9f, "%.0f deg")) cam.pitch = pitch;
+            if (ImGui::SliderFloat("Speed", &speed, 0.01f, 100.0f, "%.2fx", ImGuiSliderFlags_Logarithmic)) {
+                cam.speed_factor = speed;
+            }
+            if (ImGui::Button("Level")) cam.pitch = 0.0;
+            ImGui::SameLine();
+            if (ImGui::Button("Look up")) cam.pitch = 60.0;
+            ImGui::SameLine();
+            if (ImGui::Button("Go 100 m below ground")) {
+                cam.position = geodetic_to_ecef({eye.lat, eye.lon, v.eye_ground - 100.0});
+                cam.pitch = 30.0;
+            }
+        }
     }
     if (ImGui::CollapsingHeader("Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Checkbox("Imagery", &settings.imagery);
@@ -206,8 +297,11 @@ void ui(GlobeCamera& cam, Terrain& terrain, Renderer& renderer, RenderSettings& 
     }
     if (ImGui::CollapsingHeader("Help")) {
         ImGui::TextWrapped(
-            "Left drag: pan. Right drag: rotate and tilt. Wheel: zoom.\n"
-            "WASD: pan, Q/E: rotate, R/F: tilt, +/-: zoom, H: hide panels.");
+            "Orbit: left drag pan, right drag rotate and tilt, wheel zoom, "
+            "WASD pan, Q/E rotate, R/F tilt, +/- zoom.\n"
+            "Free fly: drag to look, WASD move, E/Space up, Q/C down, "
+            "Shift faster, Ctrl slower, wheel speed, arrows look.\n"
+            "V: orbit / free fly. H: hide panels.");
     }
     ImGui::End();
 }
@@ -284,7 +378,8 @@ int main(int argc, char** argv) {
         settings.lod_colors = args.lod_colors;
         SelectionOptions selection = terrain->options().selection;
 
-        GlobeCamera cam;
+        Views views;
+        GlobeCamera& cam = views.orbit;
         fit_store(cam, terrain->index());
         if (args.lat) cam.lat = *args.lat;
         if (args.lon) cam.lon = *args.lon;
@@ -292,10 +387,18 @@ int main(int argc, char** argv) {
         if (args.heading) cam.heading = *args.heading;
         if (args.pitch) cam.pitch = *args.pitch;
         cam.clamp();
+        if (args.fly) {
+            orbit_to_fly(views);
+            if (args.eye_height) views.fly.position = geodetic_to_ecef({cam.lat, cam.lon, *args.eye_height});
+            if (args.pitch) views.fly.pitch = *args.pitch;
+            views.fly.clamp();
+            views.flying = true;
+        }
+        FlyCamera& fly = views.fly;
 
         bool show_ui = !args.hide_ui;
-        bool h_was_down = false;
-        double ground = 0.0;
+        bool h_was_down = false, v_was_down = false;
+        double& ground = views.ground;
         bool ground_known = false;
         int stable_frames = 0;
         int frame = 0;
@@ -324,9 +427,15 @@ int main(int argc, char** argv) {
             const bool left = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
             const bool right = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS ||
                                glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
+            const double fly_above = ecef_to_geodetic(fly.position).height - views.eye_ground;
             if (!io.WantCaptureMouse) {
-                if (left && g_input.dragging_left) cam.pan_pixels(mx - g_input.last_x, my - g_input.last_y, win_h);
-                if (right && g_input.dragging_right) cam.rotate((mx - g_input.last_x) * 0.25, -(my - g_input.last_y) * 0.25);
+                const double dx = mx - g_input.last_x, dy = my - g_input.last_y;
+                if (views.flying) {
+                    if ((left && g_input.dragging_left) || (right && g_input.dragging_right)) fly.look(dx * 0.15, -dy * 0.15);
+                } else {
+                    if (left && g_input.dragging_left) cam.pan_pixels(dx, dy, win_h);
+                    if (right && g_input.dragging_right) cam.rotate(dx * 0.25, -dy * 0.25);
+                }
                 g_input.dragging_left = left;
                 g_input.dragging_right = right;
             } else {
@@ -335,22 +444,49 @@ int main(int argc, char** argv) {
             g_input.last_x = mx;
             g_input.last_y = my;
             if (g_input.scroll != 0.0) {
-                cam.zoom(g_input.scroll);
+                if (views.flying) {
+                    fly.speed_factor *= std::pow(1.25, g_input.scroll);
+                    fly.clamp();
+                } else {
+                    cam.zoom(g_input.scroll);
+                }
                 g_input.scroll = 0.0;
             }
             if (!io.WantCaptureKeyboard) {
                 auto down = [&](int key) { return glfwGetKey(window, key) == GLFW_PRESS; };
-                const double step = 600.0 * dt;
-                if (down(GLFW_KEY_W)) cam.pan_pixels(0, step, win_h);
-                if (down(GLFW_KEY_S)) cam.pan_pixels(0, -step, win_h);
-                if (down(GLFW_KEY_A)) cam.pan_pixels(step, 0, win_h);
-                if (down(GLFW_KEY_D)) cam.pan_pixels(-step, 0, win_h);
-                if (down(GLFW_KEY_Q)) cam.rotate(-60.0 * dt, 0);
-                if (down(GLFW_KEY_E)) cam.rotate(60.0 * dt, 0);
-                if (down(GLFW_KEY_R)) cam.rotate(0, 40.0 * dt);
-                if (down(GLFW_KEY_F)) cam.rotate(0, -40.0 * dt);
-                if (down(GLFW_KEY_EQUAL) || down(GLFW_KEY_KP_ADD)) cam.zoom(4.0 * dt);
-                if (down(GLFW_KEY_MINUS) || down(GLFW_KEY_KP_SUBTRACT)) cam.zoom(-4.0 * dt);
+                if (views.flying) {
+                    double speed = fly.speed(fly_above);
+                    if (down(GLFW_KEY_LEFT_SHIFT) || down(GLFW_KEY_RIGHT_SHIFT)) speed *= 5.0;
+                    if (down(GLFW_KEY_LEFT_CONTROL) || down(GLFW_KEY_RIGHT_CONTROL)) speed *= 0.2;
+                    const double ahead = (down(GLFW_KEY_W) ? 1.0 : 0.0) - (down(GLFW_KEY_S) ? 1.0 : 0.0);
+                    const double side = (down(GLFW_KEY_D) ? 1.0 : 0.0) - (down(GLFW_KEY_A) ? 1.0 : 0.0);
+                    const double rise = (down(GLFW_KEY_E) || down(GLFW_KEY_SPACE) ? 1.0 : 0.0) -
+                                        (down(GLFW_KEY_Q) || down(GLFW_KEY_C) ? 1.0 : 0.0);
+                    if (ahead != 0.0 || side != 0.0 || rise != 0.0) fly.move(ahead, side, rise, speed, dt);
+                    const double turn = 60.0 * dt;
+                    if (down(GLFW_KEY_LEFT)) fly.look(-turn, 0);
+                    if (down(GLFW_KEY_RIGHT)) fly.look(turn, 0);
+                    if (down(GLFW_KEY_UP)) fly.look(0, turn);
+                    if (down(GLFW_KEY_DOWN)) fly.look(0, -turn);
+                } else {
+                    const double step = 600.0 * dt;
+                    if (down(GLFW_KEY_W)) cam.pan_pixels(0, step, win_h);
+                    if (down(GLFW_KEY_S)) cam.pan_pixels(0, -step, win_h);
+                    if (down(GLFW_KEY_A)) cam.pan_pixels(step, 0, win_h);
+                    if (down(GLFW_KEY_D)) cam.pan_pixels(-step, 0, win_h);
+                    if (down(GLFW_KEY_Q)) cam.rotate(-60.0 * dt, 0);
+                    if (down(GLFW_KEY_E)) cam.rotate(60.0 * dt, 0);
+                    if (down(GLFW_KEY_R)) cam.rotate(0, 40.0 * dt);
+                    if (down(GLFW_KEY_F)) cam.rotate(0, -40.0 * dt);
+                    if (down(GLFW_KEY_EQUAL) || down(GLFW_KEY_KP_ADD)) cam.zoom(4.0 * dt);
+                    if (down(GLFW_KEY_MINUS) || down(GLFW_KEY_KP_SUBTRACT)) cam.zoom(-4.0 * dt);
+                }
+                const bool vk = down(GLFW_KEY_V);
+                if (vk && !v_was_down) {
+                    if (views.flying) fly_to_orbit(views); else orbit_to_fly(views);
+                    views.flying = !views.flying;
+                }
+                v_was_down = vk;
                 const bool h = down(GLFW_KEY_H);
                 if (h && !h_was_down) show_ui = !show_ui;
                 h_was_down = h;
@@ -359,20 +495,28 @@ int main(int argc, char** argv) {
 
             // Terrain.
             terrain->set_selection_options(selection);
-            const Camera rc = cam.to_runtime(fb_w, fb_h, ground_known ? ground : cam.height);
+            const Camera rc = views.flying
+                                  ? make_camera(fly.position, fly.forward(), fly.up(), fly.fov_y_deg, fb_w, fb_h,
+                                                views.eye_ground, 5.0e4)
+                                  : cam.to_runtime(fb_w, fb_h, ground_known ? ground : cam.height);
             const auto& draw = terrain->update(rc);
-            if (const auto g = ground_height(draw, cam.lat, cam.lon, terrain->options().mesh.resolution)) {
-                ground = *g * settings.exaggeration;
-                cam.height = ground_known ? cam.height + (ground - cam.height) * std::min(1.0, 10.0 * dt) : ground;
-                ground_known = true;
+            const int res = terrain->options().mesh.resolution;
+            if (!views.flying) {
+                if (const auto g = ground_height(draw, cam.lat, cam.lon, res)) {
+                    ground = *g * settings.exaggeration;
+                    cam.height = ground_known ? cam.height + (ground - cam.height) * std::min(1.0, 10.0 * dt) : ground;
+                    ground_known = true;
+                }
             }
+            const Geodetic eye_geo = ecef_to_geodetic(rc.position);
+            if (const auto g = ground_height(draw, eye_geo.lat, eye_geo.lon, res)) views.eye_ground = *g * settings.exaggeration;
 
             renderer.draw(draw, rc, fb_w, fb_h, settings);
 
             ImGui_ImplOpenGL3_NewFrame();
             ImGui_ImplGlfw_NewFrame();
             ImGui::NewFrame();
-            ui(cam, *terrain, renderer, settings, selection, args, fps, ground, show_ui);
+            ui(views, *terrain, renderer, settings, selection, args, fps, show_ui);
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
