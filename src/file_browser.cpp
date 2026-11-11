@@ -74,7 +74,7 @@ std::optional<fs::path> FileBrowser::draw() {
             error_ = "no such folder or bag";
         }
     }
-    ImGui::TextDisabled("A bag is a folder with metadata.yaml and .mcap or .db3 files, or one such file.");
+    ImGui::TextDisabled("A bag is a folder with metadata.yaml and .mcap or .db3 files, one such file, or a .tar of a bag.");
     if (!error_.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s", error_.c_str());
 
     const float footer = ImGui::GetFrameHeightWithSpacing() + 4;

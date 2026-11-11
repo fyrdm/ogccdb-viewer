@@ -1,6 +1,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -37,6 +40,74 @@ struct Writer {
         str(frame);
     }
 };
+
+/// A minimal MCAP file: one channel, messages at the given log times.
+std::string tiny_mcap(const std::vector<std::uint64_t>& times) {
+    std::string out("\x89MCAP0\r\n", 8);
+    auto u16 = [](std::string& s, std::uint16_t v) { s.append(reinterpret_cast<const char*>(&v), 2); };
+    auto u32 = [](std::string& s, std::uint32_t v) { s.append(reinterpret_cast<const char*>(&v), 4); };
+    auto u64 = [](std::string& s, std::uint64_t v) { s.append(reinterpret_cast<const char*>(&v), 8); };
+    auto str = [&](std::string& s, const std::string& v) { u32(s, static_cast<std::uint32_t>(v.size())); s += v; };
+    auto rec = [&](std::uint8_t op, const std::string& body) {
+        out += static_cast<char>(op);
+        u64(out, body.size());
+        out += body;
+    };
+    std::string b;
+    str(b, "ros2");
+    str(b, "test");
+    rec(0x01, b);  // header
+    b.clear();
+    u16(b, 1);
+    str(b, "sensor_msgs/msg/NavSatFix");
+    str(b, "ros2msg");
+    str(b, "");
+    rec(0x03, b);  // schema
+    b.clear();
+    u16(b, 7);
+    u16(b, 1);
+    str(b, "/fix");
+    str(b, "cdr");
+    u32(b, 0);
+    rec(0x04, b);  // channel
+    for (std::size_t i = 0; i < times.size(); ++i) {
+        b.clear();
+        u16(b, 7);
+        u32(b, static_cast<std::uint32_t>(i));
+        u64(b, times[i]);
+        u64(b, times[i]);
+        b += "data";
+        rec(0x05, b);  // message
+    }
+    rec(0x02, std::string(20, '\0'));  // footer
+    out.append("\x89MCAP0\r\n", 8);
+    return out;
+}
+
+/// A ustar archive with one regular file.
+std::string tiny_tar(const std::string& name, const std::string& data) {
+    char h[512] = {};
+    std::snprintf(h, 100, "%s", name.c_str());
+    std::snprintf(h + 100, 8, "%07o", 0644);
+    std::snprintf(h + 124, 12, "%011o", static_cast<unsigned>(data.size()));
+    std::snprintf(h + 136, 12, "%011o", 0u);
+    h[156] = '0';
+    std::memcpy(h + 257, "ustar", 6);
+    std::memcpy(h + 263, "00", 2);
+    std::memset(h + 148, ' ', 8);
+    unsigned sum = 0;
+    for (unsigned char c : h) sum += c;
+    std::snprintf(h + 148, 8, "%06o", sum);
+    std::string out(h, 512);
+    out += data;
+    out.append((512 - data.size() % 512) % 512, '\0');
+    out.append(1024, '\0');
+    return out;
+}
+
+void write_file(const std::filesystem::path& p, const std::string& s) {
+    std::ofstream(p, std::ios::binary).write(s.data(), static_cast<std::streamsize>(s.size()));
+}
 
 }  // namespace
 
@@ -110,6 +181,34 @@ TEST(Track, DownwardCameraLooksDownWithTopForward) {
     camera_axes(p, 0.0, f, u);
     EXPECT_NEAR(f.x, 1.0, 1e-12);
     EXPECT_NEAR(u.z, 1.0, 1e-12);
+}
+
+TEST(Bag, ReadsMcapInsideTar) {
+    const auto dir = std::filesystem::temp_directory_path() / "ogccdb_flight_tar_test";
+    std::filesystem::create_directories(dir);
+    const std::string mcap = tiny_mcap({1000, 2000, 5000});
+    write_file(dir / "b.mcap", mcap);
+    write_file(dir / "b.tar", tiny_tar("bag/b_0.mcap", mcap) );
+    EXPECT_TRUE(is_bag(dir / "b.tar"));
+    for (const char* f : {"b.mcap", "b.tar"}) {
+        auto bag = Bag::open(dir / f);
+        ASSERT_EQ(bag->topics().size(), 1u) << f;
+        EXPECT_EQ(bag->topics()[0].name, "/fix");
+        EXPECT_EQ(bag->topics()[0].type, "sensor_msgs/msg/NavSatFix");
+        EXPECT_EQ(bag->message_count(), 3u);
+        EXPECT_EQ(bag->start_ns(), 1000);
+        EXPECT_EQ(bag->end_ns(), 5000);
+        std::size_t n = 0;
+        bag->read([&](const BagMessage& m) {
+            EXPECT_EQ(std::string(reinterpret_cast<const char*>(m.data), m.size), "data");
+            ++n;
+        });
+        EXPECT_EQ(n, 3u);
+    }
+    write_file(dir / "empty.tar", tiny_tar("notes.txt", "hello"));
+    EXPECT_FALSE(is_bag(dir / "empty.tar"));
+    EXPECT_THROW(Bag::open(dir / "empty.tar"), std::runtime_error);
+    std::filesystem::remove_all(dir);
 }
 
 // Reads a real bag if OGCCDB_FLIGHT_TEST_BAG points to one.

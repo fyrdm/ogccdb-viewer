@@ -99,13 +99,17 @@ mounted under the drone.
 
 ```bash
 build-release/ogccdb-viewer <cdb> --bag ~/bags/nav_data               # a bag folder, .mcap or .db3
+build-release/ogccdb-viewer <cdb> --bag ~/Downloads/nav_data.tar      # a bag in a .tar, as shipped
 build-release/ogccdb-viewer <cdb> --bag ~/bags                        # a folder of bags: pick one
 build-release/ogccdb-viewer <cdb> --bag ~/bags/nav_data --bag-time 90 --play --speed 4
 ```
 
 **Open bag...** in the panel browses for a bag. A bag is a folder with `metadata.yaml` and
-`.mcap` or `.db3` files (rosbag2's MCAP and SQLite storage), or one such file. ROS is not
-needed: the bag is read directly and its CDR messages decoded.
+`.mcap` or `.db3` files (rosbag2's MCAP and SQLite storage), one such file, or an
+uncompressed `.tar` holding a bag. MCAP is read in place inside the tar; `.db3` files are
+copied out once to a temporary folder, since SQLite needs a real file. Compressed archives
+(`.tar.gz`, `.zip`, ...) have to be extracted first. ROS is not needed: the bag is read
+directly and its CDR messages decoded.
 
 Messages used (one topic of each is picked automatically; `ogccdb-bag-info` shows the choice):
 

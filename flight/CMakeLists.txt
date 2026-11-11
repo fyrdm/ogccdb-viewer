@@ -4,6 +4,7 @@ find_package(SQLite3 REQUIRED)
 
 add_library(ogccdb_flight STATIC
   src/bag.cpp
+  src/tar.cpp
   src/mcap.cpp
   src/sqlite_bag.cpp
   src/messages.cpp

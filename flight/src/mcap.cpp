@@ -7,6 +7,7 @@
 #include <stdexcept>
 
 #include "ogccdb/flight/bag.hpp"
+#include "storage.hpp"
 
 #ifdef OGCCDB_FLIGHT_HAVE_ZSTD
 #include <zstd.h>
@@ -70,7 +71,7 @@ std::vector<std::uint8_t> decompress(const std::string& compression, const std::
 
 class McapBag : public Bag {
 public:
-    McapBag(std::vector<std::filesystem::path> files, std::filesystem::path path) : files_(std::move(files)) {
+    McapBag(std::vector<StoragePart> parts, std::filesystem::path path) : parts_(std::move(parts)) {
         path_ = std::move(path);
         bool first = true;
         pass([&](std::size_t topic, std::int64_t t, const std::uint8_t*, std::size_t) {
@@ -166,21 +167,29 @@ private:
     }
 
     void pass(const Sink& sink) {
-        for (const auto& file : files_) {
-            std::ifstream in(file, std::ios::binary);
-            if (!in) throw std::runtime_error("cannot open " + file.string());
+        for (const auto& part : parts_) {
+            std::ifstream in(part.file, std::ios::binary);
+            if (!in) throw std::runtime_error("cannot open " + part.file.string());
+            in.seekg(static_cast<std::streamoff>(part.offset));
+            // Bytes left in this part (a tar member is followed by other data).
+            std::uint64_t left = part.size;
+            auto take = [&](std::uint64_t n) {
+                if (n > left) return false;
+                left -= n;
+                return true;
+            };
             unsigned char magic[8];
-            if (!in.read(reinterpret_cast<char*>(magic), 8) || std::memcmp(magic, kMagic, 8) != 0) {
-                throw std::runtime_error(file.string() + " is not an MCAP file");
+            if (!take(8) || !in.read(reinterpret_cast<char*>(magic), 8) || std::memcmp(magic, kMagic, 8) != 0) {
+                throw std::runtime_error(part.name + " is not an MCAP file");
             }
             FileState fs;
             std::vector<std::uint8_t> body;
             for (;;) {
                 unsigned char head[9];
-                if (!in.read(reinterpret_cast<char*>(head), 9)) break;  // end of a truncated file
+                if (!take(9) || !in.read(reinterpret_cast<char*>(head), 9)) break;  // end of a truncated file
                 std::uint64_t len = 0;
                 for (int i = 0; i < 8; ++i) len |= static_cast<std::uint64_t>(head[1 + i]) << (8 * i);
-                if (head[0] == kFooter) break;
+                if (head[0] == kFooter || !take(len)) break;
                 if (head[0] == kHeader || head[0] == kSchema || head[0] == kChannel || head[0] == kMessage ||
                     head[0] == kChunk) {
                     body.resize(len);
@@ -193,13 +202,13 @@ private:
         }
     }
 
-    std::vector<std::filesystem::path> files_;
+    std::vector<StoragePart> parts_;
 };
 
 }  // namespace
 
-std::unique_ptr<Bag> open_mcap(const std::vector<std::filesystem::path>& files, const std::filesystem::path& path) {
-    return std::make_unique<McapBag>(files, path);
+std::unique_ptr<Bag> open_mcap(const std::vector<StoragePart>& parts, const std::filesystem::path& path) {
+    return std::make_unique<McapBag>(parts, path);
 }
 
 }  // namespace ogccdb::flight
