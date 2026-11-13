@@ -82,7 +82,7 @@ void main() {
 const char* kSurfaceVs = R"(#version 330 core
 layout(location = 0) in vec3 a_rel;
 layout(location = 1) in vec3 a_up;
-layout(location = 2) in vec2 a_latlon;
+layout(location = 2) in vec3 a_latlon;  // latitude (deg), cos and sin of longitude
 layout(location = 3) in vec2 a_wave;
 uniform mat4 u_vp;
 uniform int u_wave_count;
@@ -90,7 +90,7 @@ uniform int u_vertex_waves;
 uniform vec4 u_wave[24];  // wave number east, north (rad/m); amplitude (m); phase (rad)
 out vec3 v_rel;
 out vec3 v_up;
-out vec2 v_latlon;
+out vec3 v_latlon;
 out vec2 v_wave;
 void main() {
     vec3 p = a_rel;
@@ -115,7 +115,7 @@ void main() {
 const char* kSurfaceFs = R"(#version 330 core
 in vec3 v_rel;
 in vec3 v_up;
-in vec2 v_latlon;
+in vec3 v_latlon;
 in vec2 v_wave;
 uniform int u_sea;
 uniform int u_graticule;
@@ -128,8 +128,16 @@ uniform vec3 u_east;
 uniform vec3 u_north;
 uniform float u_wave_height;
 out vec4 frag;
-float grid(vec2 coord, float spacing) {
-    vec2 g = abs(fract(coord / spacing - 0.5) - 0.5) / fwidth(coord / spacing);
+// Longitude jumps by 360 degrees at the antimeridian: take its change across
+// a pixel the short way round, so the seam doesn't turn into a wide band.
+float lon_width(float lon) {
+    float dx = dFdx(lon), dy = dFdy(lon);
+    dx -= 360.0 * floor(dx / 360.0 + 0.5);
+    dy -= 360.0 * floor(dy / 360.0 + 0.5);
+    return abs(dx) + abs(dy);
+}
+float grid(vec2 coord, vec2 width, float spacing) {
+    vec2 g = abs(fract(coord / spacing - 0.5) - 0.5) / max(width / spacing, vec2(1e-6));
     return 1.0 - min(min(g.x, g.y), 1.0);
 }
 void main() {
@@ -183,8 +191,11 @@ void main() {
     }
     if (u_graticule != 0) {
         // 1-degree lines fade out where they would crowd the screen.
-        float fine = 1.0 - smoothstep(0.05, 0.15, max(fwidth(v_latlon.x), fwidth(v_latlon.y)));
-        float l = max(grid(v_latlon, 10.0), 0.5 * fine * grid(v_latlon, 1.0));
+        // Longitude from its interpolated cosine and sine: no seam to interpolate across.
+        vec2 ll = vec2(v_latlon.x, degrees(atan(v_latlon.z, v_latlon.y)));
+        vec2 width = vec2(fwidth(ll.x), lon_width(ll.y));
+        float fine = 1.0 - smoothstep(0.05, 0.15, max(width.x, width.y));
+        float l = max(grid(ll, width, 10.0), 0.5 * fine * grid(ll, width, 1.0));
         c = mix(c, vec3(0.55, 0.65, 0.75), l * (u_sea != 0 ? 0.35 : 1.0));
     }
     if (u_haze_distance > 0.0) {
@@ -209,7 +220,7 @@ void main() { frag = u_color; }
 
 constexpr int kSurfaceRings = 96;
 constexpr int kSurfaceSegments = 160;
-constexpr int kSurfaceFloats = 10;  // eye-relative position 3, up 3, lat/lon 2, wave plane 2
+constexpr int kSurfaceFloats = 11;  // eye-relative position 3, up 3, lat + cos/sin lon 3, wave plane 2
 constexpr int kWaves = 24;
 constexpr int kVertexWaves = 6;
 // Wave numbers are whole multiples of 2 pi / kWavePeriod, so the wave field
@@ -289,9 +300,9 @@ Renderer::Renderer() {
     gl::EnableVertexAttribArray(1);
     gl::VertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(3 * sizeof(float)));
     gl::EnableVertexAttribArray(2);
-    gl::VertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(6 * sizeof(float)));
+    gl::VertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(6 * sizeof(float)));
     gl::EnableVertexAttribArray(3);
-    gl::VertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(8 * sizeof(float)));
+    gl::VertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(9 * sizeof(float)));
     gl::BindVertexArray(0);
 }
 
@@ -417,7 +428,8 @@ void Renderer::draw_surface(const Camera& camera, const RenderSettings& settings
         surface_vertices_.insert(surface_vertices_.end(),
                                  {static_cast<float>(p.x), static_cast<float>(p.y), static_cast<float>(p.z),
                                   static_cast<float>(up.x), static_cast<float>(up.y), static_cast<float>(up.z),
-                                  static_cast<float>(lat), static_cast<float>(lon),
+                                  static_cast<float>(lat), static_cast<float>(std::cos(lon * kPi / 180.0)),
+                                  static_cast<float>(std::sin(lon * kPi / 180.0)),
                                   static_cast<float>(dot(a, wave_east_)), static_cast<float>(dot(a, wave_north_))});
     };
     push(eye.lat, eye.lon);
