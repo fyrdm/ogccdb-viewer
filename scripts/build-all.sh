@@ -39,3 +39,4 @@ build "$HERE"
 
 echo
 echo "Viewer: $HERE/$BUILD_DIR/ogccdb-viewer <cdb-root>"
+echo "Camera feed for a recorded flight: $HERE/$BUILD_DIR/ogccdb-bag-render <cdb-root> <bag> <output folder>"

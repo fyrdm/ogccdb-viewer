@@ -1,4 +1,4 @@
-#include "shader.hpp"
+#include "ogccdb/render/shader.hpp"
 
 #include <stdexcept>
 #include <vector>
@@ -22,6 +22,8 @@ GLuint compile(GLenum type, const char* src) {
 }
 }  // namespace
 
+namespace ogccdb::render {
+
 GLuint make_program(const char* vertex_source, const char* fragment_source) {
     const GLuint vs = compile(GL_VERTEX_SHADER, vertex_source);
     const GLuint fs = compile(GL_FRAGMENT_SHADER, fragment_source);
@@ -43,3 +45,5 @@ GLuint make_program(const char* vertex_source, const char* fragment_source) {
     }
     return p;
 }
+
+}  // namespace ogccdb::render

@@ -62,7 +62,18 @@
     X(PFNGLDELETETEXTURESPROC, DeleteTextures)                         \
     X(PFNGLACTIVETEXTUREPROC, ActiveTexture)                           \
     X(PFNGLDRAWELEMENTSPROC, DrawElements)                             \
-    X(PFNGLDRAWARRAYSPROC, DrawArrays)
+    X(PFNGLDRAWARRAYSPROC, DrawArrays)                                 \
+    X(PFNGLUNIFORMMATRIX3FVPROC, UniformMatrix3fv)                     \
+    X(PFNGLGENFRAMEBUFFERSPROC, GenFramebuffers)                       \
+    X(PFNGLDELETEFRAMEBUFFERSPROC, DeleteFramebuffers)                 \
+    X(PFNGLBINDFRAMEBUFFERPROC, BindFramebuffer)                       \
+    X(PFNGLFRAMEBUFFERTEXTURE2DPROC, FramebufferTexture2D)             \
+    X(PFNGLFRAMEBUFFERRENDERBUFFERPROC, FramebufferRenderbuffer)       \
+    X(PFNGLCHECKFRAMEBUFFERSTATUSPROC, CheckFramebufferStatus)         \
+    X(PFNGLGENRENDERBUFFERSPROC, GenRenderbuffers)                     \
+    X(PFNGLDELETERENDERBUFFERSPROC, DeleteRenderbuffers)               \
+    X(PFNGLBINDRENDERBUFFERPROC, BindRenderbuffer)                     \
+    X(PFNGLRENDERBUFFERSTORAGEPROC, RenderbufferStorage)
 
 namespace gl {
 #define OGCCDB_GL_DECLARE(type, name) extern type name;

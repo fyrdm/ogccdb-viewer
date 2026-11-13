@@ -15,6 +15,13 @@ using runtime::kRadToDeg;
 using runtime::local_east;
 using runtime::local_north;
 
+bool is_estimate(const BagTopic& topic) {
+    for (const auto& [key, value] : topic.metadata) {
+        if (key == kRoleKey && value == kRoleEstimate) return true;
+    }
+    return false;
+}
+
 Vec3d rotate(const Quat& q, Vec3d v) {
     // v' = v + 2 w (u x v) + 2 u x (u x v), u = (x, y, z)
     const Vec3d u{q.x, q.y, q.z};
@@ -55,10 +62,12 @@ double seconds(std::int64_t ns, std::int64_t t0) { return static_cast<double>(ns
 /// Header stamp if the publisher set one, else the log time.
 std::int64_t message_time(const Stamp& s, std::int64_t log_time) { return s.ns > 0 ? s.ns : log_time; }
 
-const BagTopic* busiest(const Bag& bag, MessageKind kind) {
+const BagTopic* busiest(const Bag& bag, MessageKind kind, MessageKind or_kind = MessageKind::Unknown) {
     const BagTopic* best = nullptr;
     for (const BagTopic& t : bag.topics()) {
-        if (message_kind(t.type) == kind && (!best || t.count > best->count)) best = &t;
+        const MessageKind k = message_kind(t.type);
+        if (k == MessageKind::Unknown || (k != kind && k != or_kind) || is_estimate(t)) continue;
+        if (!best || t.count > best->count) best = &t;
     }
     return best;
 }
@@ -89,8 +98,7 @@ FlightTrack FlightTrack::build(Bag& bag, const TrackOptions& opt) {
         fix = bag.topic(opt.fix_topic);
         if (!fix) throw std::runtime_error("no topic " + opt.fix_topic + " in the bag");
     } else {
-        fix = busiest(bag, MessageKind::GeoPose);
-        if (!fix) fix = busiest(bag, MessageKind::NavSatFix);
+        fix = busiest(bag, MessageKind::GeoPose, MessageKind::NavSatFix);
     }
     if (!fix) throw std::runtime_error("the bag has no NavSatFix or GeoPoseStamped topic for the position");
     const BagTopic* local = nullptr;

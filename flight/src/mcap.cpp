@@ -74,7 +74,7 @@ public:
     McapBag(std::vector<StoragePart> parts, std::filesystem::path path) : parts_(std::move(parts)) {
         path_ = std::move(path);
         bool first = true;
-        pass([&](std::size_t topic, std::int64_t t, const std::uint8_t*, std::size_t) {
+        pass([&](std::size_t topic, std::int64_t t, std::int64_t, const std::uint8_t*, std::size_t) {
             ++topics_[topic].count;
             if (first || t < start_ns_) start_ns_ = t;
             if (first || t > end_ns_) end_ns_ = t;
@@ -88,24 +88,38 @@ public:
               const std::function<bool(const BagTopic&)>& want) override {
         std::vector<char> wanted(topics_.size());
         for (std::size_t i = 0; i < topics_.size(); ++i) wanted[i] = !want || want(topics_[i]);
-        pass([&](std::size_t topic, std::int64_t t, const std::uint8_t* d, std::size_t n) {
-            if (topic < wanted.size() && wanted[topic]) fn(BagMessage{&topics_[topic], t, d, n});
+        pass([&](std::size_t topic, std::int64_t t, std::int64_t publish, const std::uint8_t* d, std::size_t n) {
+            if (topic < wanted.size() && wanted[topic]) fn(BagMessage{&topics_[topic], t, d, n, publish});
         });
     }
 
 private:
-    using Sink = std::function<void(std::size_t topic, std::int64_t t, const std::uint8_t*, std::size_t)>;
+    using Sink = std::function<void(std::size_t topic, std::int64_t t, std::int64_t publish, const std::uint8_t*,
+                                    std::size_t)>;
 
+    struct Schema {
+        std::string name, encoding, data;
+    };
     struct FileState {
-        std::map<std::uint16_t, std::string> schema_name;
+        std::map<std::uint16_t, Schema> schemas;
         std::map<std::uint16_t, std::size_t> channel_topic;  // channel id -> index in topics_
     };
 
-    std::size_t topic_index(const std::string& name, const std::string& type, const std::string& encoding) {
+    std::size_t topic_index(const std::string& name, const Schema* schema, const std::string& encoding,
+                            std::vector<std::pair<std::string, std::string>> metadata) {
         for (std::size_t i = 0; i < topics_.size(); ++i) {
             if (topics_[i].name == name) return i;
         }
-        topics_.push_back(BagTopic{name, type, encoding, 0});
+        BagTopic t;
+        t.name = name;
+        t.encoding = encoding;
+        if (schema) {
+            t.type = schema->name;
+            t.schema_encoding = schema->encoding;
+            t.schema = schema->data;
+        }
+        t.metadata = std::move(metadata);
+        topics_.push_back(std::move(t));
         return topics_.size() - 1;
     }
 
@@ -114,7 +128,11 @@ private:
         switch (op) {
             case kSchema: {
                 const auto id = c.num<std::uint16_t>();
-                fs.schema_name[id] = c.str();
+                Schema sc;
+                sc.name = c.str();
+                sc.encoding = c.str();
+                sc.data = c.str();  // uint32 length + bytes, like a string
+                fs.schemas[id] = std::move(sc);
                 break;
             }
             case kChannel: {
@@ -122,17 +140,30 @@ private:
                 const auto schema = c.num<std::uint16_t>();
                 const std::string topic = c.str();
                 const std::string encoding = c.str();
-                const auto it = fs.schema_name.find(schema);
-                fs.channel_topic[id] = topic_index(topic, it != fs.schema_name.end() ? it->second : "", encoding);
+                std::vector<std::pair<std::string, std::string>> metadata;
+                if (c.end - c.p >= 4) {  // Map<string, string>: byte length, then pairs
+                    const auto n = c.num<std::uint32_t>();
+                    c.need(n);
+                    Cursor m{c.p, c.p + n};
+                    while (m.p < m.end) {
+                        std::string k = m.str();
+                        metadata.emplace_back(std::move(k), m.str());
+                    }
+                }
+                const auto it = fs.schemas.find(schema);
+                fs.channel_topic[id] =
+                    topic_index(topic, it != fs.schemas.end() ? &it->second : nullptr, encoding, std::move(metadata));
                 break;
             }
             case kMessage: {
                 const auto channel = c.num<std::uint16_t>();
                 c.num<std::uint32_t>();  // sequence
                 const auto log_time = static_cast<std::int64_t>(c.num<std::uint64_t>());
-                c.num<std::uint64_t>();  // publish time
+                const auto publish_time = static_cast<std::int64_t>(c.num<std::uint64_t>());
                 const auto it = fs.channel_topic.find(channel);
-                if (it != fs.channel_topic.end()) sink(it->second, log_time, c.p, static_cast<std::size_t>(c.end - c.p));
+                if (it != fs.channel_topic.end()) {
+                    sink(it->second, log_time, publish_time, c.p, static_cast<std::size_t>(c.end - c.p));
+                }
                 break;
             }
             case kChunk: {

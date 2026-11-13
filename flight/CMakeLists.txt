@@ -1,11 +1,14 @@
 # ogccdb-flight: vehicle flights from ROS 2 bags (MCAP or SQLite storage),
-# without ROS. No graphics: usable from any renderer or engine.
+# without ROS, and MCAP bags written back. No graphics: usable from any
+# renderer or engine.
 find_package(SQLite3 REQUIRED)
 
 add_library(ogccdb_flight STATIC
   src/bag.cpp
   src/tar.cpp
   src/mcap.cpp
+  src/mcap_writer.cpp
+  src/bag_metadata.cpp
   src/sqlite_bag.cpp
   src/messages.cpp
   src/track.cpp

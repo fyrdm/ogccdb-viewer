@@ -26,9 +26,3 @@ struct GlobeCamera {
     /// Runtime camera for a viewport; near and far planes follow the eye height.
     ogccdb::runtime::Camera to_runtime(int width, int height, double ground_height) const;
 };
-
-/// Runtime camera at `eye` for a viewport. Near and far planes follow the
-/// distance to the ground, above or below it; `max_near` caps the near plane.
-ogccdb::runtime::Camera make_camera(ogccdb::runtime::Vec3d eye, ogccdb::runtime::Vec3d forward,
-                                    ogccdb::runtime::Vec3d up, double fov_y_deg, int width, int height,
-                                    double ground_height, double max_near);

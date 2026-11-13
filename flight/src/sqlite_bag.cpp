@@ -1,8 +1,10 @@
 // SQLite storage (.db3, the rosbag2 default before ROS 2 Iron): tables
-// topics(id, name, type, serialization_format) and
-// messages(id, topic_id, timestamp, data).
+// topics(id, name, type, serialization_format[, offered_qos_profiles, ...]),
+// messages(id, topic_id, timestamp, data) and, in newer versions,
+// message_definitions(topic_type, encoding, encoded_message_definition, ...).
 #include <map>
 #include <stdexcept>
+#include <utility>
 
 #include <sqlite3.h>
 
@@ -59,6 +61,7 @@ public:
                 if (first || t1 > end_ns_) end_ns_ = t1;
                 first = false;
             }
+            read_optional_metadata(db);
         }
     }
 
@@ -81,18 +84,49 @@ public:
                 const auto it = ids.find(sqlite3_column_int64(q.s, 0));
                 if (it == ids.end()) continue;
                 const auto* d = static_cast<const std::uint8_t*>(sqlite3_column_blob(q.s, 2));
-                fn(BagMessage{&topics_[it->second], sqlite3_column_int64(q.s, 1), d,
-                              static_cast<std::size_t>(sqlite3_column_bytes(q.s, 2))});
+                const std::int64_t t = sqlite3_column_int64(q.s, 1);
+                fn(BagMessage{&topics_[it->second], t, d, static_cast<std::size_t>(sqlite3_column_bytes(q.s, 2)), t});
             }
         }
     }
 
 private:
+    /// QoS profiles and message definitions, which only newer rosbag2 versions store.
+    void read_optional_metadata(Db& db) {
+        try {
+            Stmt q(db.db, "SELECT name, offered_qos_profiles FROM topics");
+            while (sqlite3_step(q.s) == SQLITE_ROW) {
+                const std::string qos = text(q.s, 1);
+                BagTopic& t = topics_[topic_index(text(q.s, 0), "", "")];
+                if (!qos.empty() && t.metadata.empty()) t.metadata.emplace_back("offered_qos_profiles", qos);
+            }
+        } catch (const std::runtime_error&) {
+            // no such column
+        }
+        try {
+            Stmt q(db.db, "SELECT topic_type, encoding, encoded_message_definition FROM message_definitions");
+            while (sqlite3_step(q.s) == SQLITE_ROW) {
+                for (BagTopic& t : topics_) {
+                    if (t.type == text(q.s, 0) && t.schema.empty()) {
+                        t.schema_encoding = text(q.s, 1);
+                        t.schema = text(q.s, 2);
+                    }
+                }
+            }
+        } catch (const std::runtime_error&) {
+            // no such table
+        }
+    }
+
     std::size_t topic_index(const std::string& name, const std::string& type, const std::string& format) {
         for (std::size_t i = 0; i < topics_.size(); ++i) {
             if (topics_[i].name == name) return i;
         }
-        topics_.push_back(BagTopic{name, type, format, 0});
+        BagTopic t;
+        t.name = name;
+        t.type = type;
+        t.encoding = format;
+        topics_.push_back(std::move(t));
         return topics_.size() - 1;
     }
 

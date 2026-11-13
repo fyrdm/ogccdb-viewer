@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "ogccdb/render/camera.hpp"
 #include "ogccdb/runtime/geodesy.hpp"
 
 using namespace ogccdb::runtime;
@@ -57,24 +58,6 @@ void GlobeCamera::clamp() {
     distance = std::clamp(distance, 10.0, 3.0e7);
 }
 
-Camera make_camera(Vec3d eye, Vec3d forward, Vec3d up, double fov_y_deg, int width, int height_px,
-                   double ground_height, double max_near) {
-    Camera c;
-    c.position = eye;
-    c.direction = forward;
-    c.up = up;
-    c.fov_y = fov_y_deg * kDegToRad;
-    c.aspect = static_cast<double>(std::max(width, 1)) / std::max(height_px, 1);
-    c.viewport_height = std::max(height_px, 1);
-    // Distance to the ground, above or below it (the eye may be underground).
-    const double to_ground = std::max(std::fabs(ecef_to_geodetic(eye).height - ground_height), 1.0);
-    c.near_plane = std::clamp(std::min(to_ground * 0.05, max_near), 0.1, 5.0e4);
-    const double r = length(eye);
-    const double horizon = std::sqrt(std::max(r * r - kWgs84B * kWgs84B, 0.0));
-    c.far_plane = std::max(std::min(r + 1.0e5, horizon + 5.0e5), c.near_plane * 10.0);
-    return c;
-}
-
 Camera GlobeCamera::to_runtime(int width, int height_px, double ground_height) const {
-    return make_camera(eye(), forward(), up(), fov_y_deg, width, height_px, ground_height, distance * 0.1);
+    return ogccdb::render::make_camera(eye(), forward(), up(), fov_y_deg, width, height_px, ground_height, distance * 0.1);
 }
