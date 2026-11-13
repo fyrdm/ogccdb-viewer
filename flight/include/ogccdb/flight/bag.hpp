@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ogccdb::flight {
@@ -16,6 +17,12 @@ struct BagTopic {
     std::string type;      ///< e.g. sensor_msgs/msg/NavSatFix
     std::string encoding;  ///< message encoding, "cdr" for ROS 2
     std::uint64_t count = 0;
+    /// Message definition as the storage holds it (MCAP schema: encoding
+    /// "ros2msg" and the .msg text with its dependencies); empty if it has none.
+    std::string schema_encoding;
+    std::string schema;
+    /// Key-value metadata of the topic, e.g. offered_qos_profiles (YAML).
+    std::vector<std::pair<std::string, std::string>> metadata;
 };
 
 struct BagMessage {
@@ -23,6 +30,7 @@ struct BagMessage {
     std::int64_t log_time_ns = 0;  ///< when the recorder received it
     const std::uint8_t* data = nullptr;
     std::size_t size = 0;
+    std::int64_t publish_time_ns = 0;  ///< when it was sent, if stored; else log_time_ns
 };
 
 class Bag {

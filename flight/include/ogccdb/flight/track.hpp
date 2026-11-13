@@ -31,6 +31,13 @@ struct FlightPose {
     double ground_speed = 0.0, climb = 0.0;     ///< m/s
 };
 
+/// A topic can say in its metadata that it is somebody's estimate of the pose
+/// (a prior, a filter output) and not a measurement of it. Such a topic is
+/// never picked as the flight's position or attitude unless it is named.
+inline constexpr const char* kRoleKey = "ogccdb_role";
+inline constexpr const char* kRoleEstimate = "estimate";
+bool is_estimate(const BagTopic& topic);
+
 struct TrackOptions {
     std::string fix_topic;       ///< NavSatFix or GeoPoseStamped; empty = the busiest one
     std::string local_topic;     ///< local pose in an ENU frame; empty = the busiest one, "-" = none

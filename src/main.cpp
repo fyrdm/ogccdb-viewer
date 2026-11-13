@@ -14,7 +14,6 @@
 #include <string>
 #include <vector>
 
-#include "gl.hpp"
 #include "file_browser.hpp"
 #include "flight_player.hpp"
 #include "fly_camera.hpp"
@@ -24,13 +23,16 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include "ogccdb/cdb13/lod.hpp"
+#include "ogccdb/render/camera.hpp"
+#include "ogccdb/render/gl.hpp"
+#include "ogccdb/render/image.hpp"
+#include "ogccdb/render/renderer.hpp"
 #include "ogccdb/runtime/geodesy.hpp"
 #include "ogccdb/runtime/terrain.hpp"
-#include "renderer.hpp"
-#include "screenshot.hpp"
 
 using namespace ogccdb;
 using namespace ogccdb::runtime;
+using namespace ogccdb::render;
 using ogccdb::flight::FlightPose;
 using ogccdb::flight::camera_axes;
 
@@ -153,31 +155,6 @@ std::optional<Args> parse(int argc, char** argv) {
     }
     if (a.cdb.empty()) return std::nullopt;
     return a;
-}
-
-/// Terrain height at (lat, lon) from the finest drawn tile over it, by bilinear
-/// interpolation of its mesh grid; nullopt if no drawn tile covers it.
-std::optional<double> ground_height(const std::vector<DrawTile>& tiles, double lat, double lon, int resolution,
-                                    int* lod = nullptr) {
-    const DrawTile* best = nullptr;
-    for (const DrawTile& d : tiles) {
-        const GeoExtent e = cdb13::extent(d.tile);
-        if (lat >= e.south && lat <= e.north && lon >= e.west && lon <= e.east && (!best || d.tile.lod > best->tile.lod)) {
-            best = &d;
-        }
-    }
-    if (!best) return std::nullopt;
-    if (lod) *lod = best->tile.lod;
-    const GeoExtent e = cdb13::extent(best->tile);
-    const auto& h = best->data->mesh.heights;
-    const int side = resolution + 1;
-    if (h.size() < static_cast<std::size_t>(side) * side) return std::nullopt;
-    const double x = std::clamp((lon - e.west) / (e.east - e.west), 0.0, 1.0) * resolution;
-    const double y = std::clamp((e.north - lat) / (e.north - e.south), 0.0, 1.0) * resolution;
-    const int i0 = std::min(static_cast<int>(x), resolution - 1), j0 = std::min(static_cast<int>(y), resolution - 1);
-    const double fx = x - i0, fy = y - j0;
-    auto at = [&](int i, int j) { return static_cast<double>(h[static_cast<std::size_t>(j) * side + i]); };
-    return (at(i0, j0) * (1 - fx) + at(i0 + 1, j0) * fx) * (1 - fy) + (at(i0, j0 + 1) * (1 - fx) + at(i0 + 1, j0 + 1) * fx) * fy;
 }
 
 void fit_store(GlobeCamera& cam, const TileIndex& index) {

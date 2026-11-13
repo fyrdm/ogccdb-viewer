@@ -7,8 +7,10 @@
 #include <unordered_map>
 #include <vector>
 
-#include "gl.hpp"
+#include "ogccdb/render/gl.hpp"
 #include "ogccdb/runtime/terrain.hpp"
+
+namespace ogccdb::render {
 
 struct RenderSettings {
     bool imagery = true;
@@ -49,6 +51,16 @@ public:
 
     const RenderStats& stats() const { return stats_; }
 
+    /// Draws where the terrain is instead of its colour, into the bound target,
+    /// which must be a Framebuffer with Format::Rgba32f: per pixel the surface
+    /// point in a local frame (`origin` and its axes `ax`, `ay`, `az`, ECEF unit
+    /// vectors; metres) and, in w, its distance from the eye. w is 0 where no
+    /// terrain is drawn (sky, sea). Heights are drawn as they are (no
+    /// exaggeration), so draw() must use an exaggeration of 1 to match.
+    void draw_positions(const std::vector<ogccdb::runtime::DrawTile>& tiles, const ogccdb::runtime::Camera& camera,
+                        int width, int height, ogccdb::runtime::Vec3d origin, ogccdb::runtime::Vec3d ax,
+                        ogccdb::runtime::Vec3d ay, ogccdb::runtime::Vec3d az);
+
     /// Draws lines through ECEF points (GL_LINE_STRIP or GL_LINES) over the
     /// last draw(). Where terrain hides them they are drawn with `hidden_alpha`.
     void draw_lines(const std::vector<ogccdb::runtime::Vec3d>& points, GLenum mode, const float rgba[4],
@@ -66,6 +78,8 @@ private:
         const ogccdb::runtime::TerrainTile* source = nullptr;
     };
 
+    /// The GPU copy of a tile to draw, uploaded (again) if needed.
+    GpuTile& acquire(const ogccdb::runtime::DrawTile& d);
     GpuTile upload(const ogccdb::runtime::TerrainTile& t);
     void release(GpuTile& g);
     void draw_surface(const ogccdb::runtime::Camera& camera, const RenderSettings& settings, const float sky[3],
@@ -75,6 +89,7 @@ private:
     std::vector<float> wave_uniforms(const RenderSettings& settings) const;
 
     GLuint terrain_program_ = 0;
+    GLuint position_program_ = 0;
     GLuint line_program_ = 0;
     GLuint line_vao_ = 0, line_vbo_ = 0;
     std::vector<float> line_vertices_;
@@ -91,3 +106,5 @@ private:
     std::unordered_map<ogccdb::runtime::TileAddress, GpuTile, ogccdb::runtime::TileAddressHash> tiles_;
     RenderStats stats_;
 };
+
+}  // namespace ogccdb::render

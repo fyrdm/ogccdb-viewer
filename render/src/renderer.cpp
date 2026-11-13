@@ -1,4 +1,4 @@
-#include "renderer.hpp"
+#include "ogccdb/render/renderer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -6,7 +6,9 @@
 #include <cmath>
 
 #include "ogccdb/runtime/geodesy.hpp"
-#include "shader.hpp"
+#include "ogccdb/render/shader.hpp"
+
+namespace ogccdb::render {
 
 using namespace ogccdb::runtime;
 
@@ -218,6 +220,28 @@ out vec4 frag;
 void main() { frag = u_color; }
 )";
 
+// Position pass: the surface point in a local frame and its distance from the eye.
+const char* kPositionVs = R"(#version 330 core
+layout(location = 0) in vec3 a_position;
+uniform mat4 u_mvp;
+uniform mat4 u_model_view;
+uniform vec3 u_offset;    // tile centre minus the frame's origin (ECEF, metres)
+uniform mat3 u_to_frame;  // ECEF to the frame's axes
+out vec3 v_local;
+out float v_range;
+void main() {
+    gl_Position = u_mvp * vec4(a_position, 1.0);
+    v_local = u_to_frame * (u_offset + a_position);
+    v_range = length((u_model_view * vec4(a_position, 1.0)).xyz);
+}
+)";
+const char* kPositionFs = R"(#version 330 core
+in vec3 v_local;
+in float v_range;
+out vec4 frag;
+void main() { frag = vec4(v_local, max(v_range, 1e-6)); }
+)";
+
 constexpr int kSurfaceRings = 96;
 constexpr int kSurfaceSegments = 160;
 constexpr int kSurfaceFloats = 11;  // eye-relative position 3, up 3, lat + cos/sin lon 3, wave plane 2
@@ -257,6 +281,7 @@ std::array<float, 3> lod_color(int lod) {
 
 Renderer::Renderer() {
     terrain_program_ = make_program(kTerrainVs, kTerrainFs);
+    position_program_ = make_program(kPositionVs, kPositionFs);
     surface_program_ = make_program(kSurfaceVs, kSurfaceFs);
     line_program_ = make_program(kLineVs, kLineFs);
     gl::GenVertexArrays(1, &line_vao_);
@@ -312,10 +337,63 @@ Renderer::~Renderer() {
     gl::DeleteBuffers(1, &surface_vbo_);
     gl::DeleteBuffers(1, &surface_ibo_);
     gl::DeleteProgram(terrain_program_);
+    gl::DeleteProgram(position_program_);
     gl::DeleteProgram(surface_program_);
     gl::DeleteVertexArrays(1, &line_vao_);
     gl::DeleteBuffers(1, &line_vbo_);
     gl::DeleteProgram(line_program_);
+}
+
+Renderer::GpuTile& Renderer::acquire(const DrawTile& d) {
+    auto it = tiles_.find(d.tile);
+    if (it != tiles_.end() && it->second.source != d.data.get()) {
+        release(it->second);  // rebuilt by the runtime: upload the new data
+        tiles_.erase(it);
+        it = tiles_.end();
+    }
+    if (it == tiles_.end()) {
+        it = tiles_.emplace(d.tile, upload(*d.data)).first;
+        ++stats_.uploads;
+    }
+    it->second.last_used = frame_;
+    return it->second;
+}
+
+void Renderer::draw_positions(const std::vector<DrawTile>& tiles, const Camera& camera, int width, int height,
+                              Vec3d origin, Vec3d ax, Vec3d ay, Vec3d az) {
+    gl::Viewport(0, 0, width, height);
+    gl::ClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // w = 0: nothing drawn
+    gl::ClearDepth(1.0);
+    gl::Clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    gl::Enable(GL_DEPTH_TEST);
+    gl::DepthFunc(GL_LEQUAL);
+    gl::Disable(GL_CULL_FACE);
+    gl::Disable(GL_BLEND);
+
+    const Mat4d rot = look_at_direction({0, 0, 0}, camera.direction, camera.up);
+    const Mat4d proj = camera.projection();
+    gl::UseProgram(position_program_);
+    const GLint loc_mvp = gl::GetUniformLocation(position_program_, "u_mvp");
+    const GLint loc_mv = gl::GetUniformLocation(position_program_, "u_model_view");
+    const GLint loc_offset = gl::GetUniformLocation(position_program_, "u_offset");
+    // Rows are the frame's axes; uploaded row-major (transpose = GL_TRUE).
+    const float to_frame[9] = {static_cast<float>(ax.x), static_cast<float>(ax.y), static_cast<float>(ax.z),
+                               static_cast<float>(ay.x), static_cast<float>(ay.y), static_cast<float>(ay.z),
+                               static_cast<float>(az.x), static_cast<float>(az.y), static_cast<float>(az.z)};
+    gl::UniformMatrix3fv(gl::GetUniformLocation(position_program_, "u_to_frame"), 1, GL_TRUE, to_frame);
+    for (const DrawTile& d : tiles) {
+        GpuTile& gt = acquire(d);
+        const Mat4d mv = rot * translation(d.data->mesh.center - camera.position);
+        const auto f_mvp = to_float(proj * mv);
+        const auto f_mv = to_float(mv);
+        gl::UniformMatrix4fv(loc_mvp, 1, GL_FALSE, f_mvp.data());
+        gl::UniformMatrix4fv(loc_mv, 1, GL_FALSE, f_mv.data());
+        const Vec3d off = d.data->mesh.center - origin;  // double, then float
+        gl::Uniform3f(loc_offset, static_cast<float>(off.x), static_cast<float>(off.y), static_cast<float>(off.z));
+        gl::BindVertexArray(gt.vao);
+        gl::DrawElements(GL_TRIANGLES, gt.index_count, GL_UNSIGNED_INT, nullptr);
+    }
+    gl::BindVertexArray(0);
 }
 
 Renderer::GpuTile Renderer::upload(const TerrainTile& t) {
@@ -599,18 +677,7 @@ void Renderer::draw(const std::vector<DrawTile>& tiles, const Camera& camera, in
     if (settings.wireframe) gl::PolygonMode(GL_FRONT_AND_BACK, GL_LINE);
 
     for (const DrawTile& d : tiles) {
-        auto it = tiles_.find(d.tile);
-        if (it != tiles_.end() && it->second.source != d.data.get()) {
-            release(it->second);  // rebuilt by the runtime: upload the new data
-            tiles_.erase(it);
-            it = tiles_.end();
-        }
-        if (it == tiles_.end()) {
-            it = tiles_.emplace(d.tile, upload(*d.data)).first;
-            ++stats_.uploads;
-        }
-        GpuTile& gt = it->second;
-        gt.last_used = frame_;
+        GpuTile& gt = acquire(d);
 
         const Mat4d mv = rot * translation(d.data->mesh.center - camera.position);
         const auto f_mvp = to_float(proj * mv);
@@ -649,3 +716,5 @@ void Renderer::draw(const std::vector<DrawTile>& tiles, const Camera& camera, in
     }
     stats_.gpu_tiles = tiles_.size();
 }
+
+}  // namespace ogccdb::render

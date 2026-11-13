@@ -6,6 +6,13 @@ GLFW and Dear ImGui. All CDB logic (LOD selection, tile loading, meshes) lives i
 [ogccdb-runtimepublisher](https://github.com/fyrdm/ogccdb-runtimepublisher), on top of
 [ogccdb-core](https://github.com/fyrdm/ogccdb-core); this repo only renders. MIT licence.
 
+| Folder | What it is |
+| --- | --- |
+| `src/` | the viewer application (window, panels, cameras) |
+| `render/` | library `ogccdb::render`: draws the terrain with OpenGL, into a window or off screen |
+| `flight/` | library `ogccdb::flight`: reads and writes ROS 2 bags without ROS, builds the flight track |
+| `tools/bag-render/` | `ogccdb-bag-render`: adds a simulated camera to a recorded flight (below) |
+
 ## Build (Ubuntu/Debian)
 
 ```bash
@@ -146,3 +153,105 @@ or hundreds of metres); or a manual *Offset*.
 
 `ogccdb-bag-info <bag> [seconds...]` prints the bag's topics, the track it builds and the pose
 at the given times.
+
+## Camera feed for a recorded flight (`ogccdb-bag-render`)
+
+`ogccdb-bag-render` takes a bag with a flight's positions and attitudes but no camera, flies
+it over a CDB store, and writes a copy of the bag with what a camera on the vehicle would
+have seen. It is meant for developing vision-based localization against CDB data before a
+recording with a real camera exists: the new bag plays like any other, and side files hold
+the truth to compare with. It opens no window.
+
+```bash
+build-release/ogccdb-bag-render <cdb> ~/bags/nav_data ~/bags/nav_data_camera
+build-release/ogccdb-bag-render <cdb> <bag> <out> --tilt -45 --hfov 70 --rate 5
+build-release/ogccdb-bag-render <cdb> <bag> <out> --realistic --distortion=-0.2,0.05,0,0,0
+build-release/ogccdb-bag-render <cdb> <bag> <out> --from 60 --to 120 --truth-every 1
+build-release/ogccdb-bag-render <cdb> <bag> <out> --drop /mavros/global_position/global
+```
+
+The output folder is the new bag (`metadata.yaml` and one `.mcap`), with a `truth/` folder
+inside it:
+
+| In the new bag | |
+| --- | --- |
+| every topic of the input | copied as it is (`--drop <topic>` leaves one out) |
+| `/camera/image_raw/compressed` | `sensor_msgs/CompressedImage`, JPEG, 10 Hz by default |
+| `/camera/camera_info` | `sensor_msgs/CameraInfo` for each image: K, plumb_bob D, R = identity, P = [K \| 0] |
+| `/tf_static` | the mount: `base_link` to `camera_optical_frame`, once at the start |
+| `/prior/geo_pose` | `geographic_msgs/GeoPoseStamped` for each frame: the drifting prior (below) |
+
+Images, camera_info and prior of one frame carry the same header stamp. Stamps are on the
+clock of the input's own header stamps, and the messages are filed at the time a recorder
+would have received them. Topic names and frame ids can be changed (`--image-topic`,
+`--info-topic`, `--prior-topic`, `--camera-frame`, `--body-frame`).
+
+**Camera.** A pinhole camera: `--size` and `--hfov`, or `--intrinsics fx,fy,cx,cy` in the
+camera_info convention (pixel centres at whole numbers, (0, 0) the centre of the top-left
+pixel). `--distortion k1,k2,p1,p2,k3` adds lens distortion: the scene is rendered as a wider
+ideal image and resampled through the lens model, so the image, the camera_info and the
+truth agree. The mount is given on the body (x forward, y left, z up): `--tilt` (-90 straight
+down with the image top toward the nose, 0 forward), `--pan` (positive turns the camera
+left), `--roll` (about the viewing direction) and `--mount-offset x,y,z`. The image's frame
+is the optical one: x right, y down, z into the scene.
+
+**Image realism.** A render of the map's own imagery is an easy target for a matcher; these
+make it less so. They are applied in this order, and all are off by default:
+
+| Option | |
+| --- | --- |
+| `--blur <px>` | lens blur (Gaussian sigma) |
+| `--vignette <0..1>` | how much darker the corners are |
+| `--gains r,g,b`, `--brightness`, `--contrast`, `--saturation`, `--gamma` | colour |
+| `--noise <levels>` | sensor noise, sigma in 8-bit levels |
+| `--jpeg-quality <1..100>` | compression (default 90) |
+| `--realistic` | a moderate amount of each; options after it adjust it |
+
+**Prior pose.** A localizer needs a rough idea of where it is, and must not be handed the
+answer. `/prior/geo_pose` is the true pose plus an error that grows as dead reckoning
+without GNSS does: on each horizontal axis the velocity error is a random walk
+(`--drift-velocity`, m/s per sqrt(s); the position error's standard deviation is that times
+t^1.5 / sqrt(3): about 30 m after 5 minutes at the default 0.01), height and heading errors
+are random walks (`--drift-height`, `--drift-yaw`), the heading starts off by `--yaw-bias`
+degrees, roll and pitch get `--tilt-noise`, and `--start-error` puts the first position off
+by so many metres. `--seed` repeats a run exactly. The error is not reset by anything: a
+localizer should take the prior's changes from frame to frame, as it would from odometry.
+The input's own position topics are still in the bag unless dropped.
+
+**Truth.** In `truth/`:
+
+| File | |
+| --- | --- |
+| `frames.csv` | one row per frame time: the vehicle's true position (`lat`, `lon`, `height` above the ellipsoid) and attitude (`qx..qw`, body to local ENU), the camera in the local frame (`cam_e`, `cam_n`, `cam_u`, and `cam_qx..cam_qw`, optical frame to local frame), the prior and its error, the height above the terrain, whether an image was written |
+| `camera.json` | intrinsics, mount, the local frame's origin, and every setting of the run |
+| `000120.npy`, `000120.jpg` | for every n-th image (`--truth-every`, default 10): the ground point seen by each pixel, float32 of shape (height, width, 3), east, north, up in metres in the local frame, NaN where there is no terrain; and the image itself. The number is the `frame` column. |
+
+The local frame is east, north, up at the start of the flight (a plane tangent to the
+ellipsoid there). A ground-point file is 12 bytes a pixel (11 MB at 1280x720), so write
+them for every frame only over a short `--from`/`--to` range. With them a match between an
+image pixel and the map can be checked directly, and solving the camera pose from the
+pixels and their ground points gives back `cam_*` of that row:
+
+```python
+import csv, json, numpy as np, cv2
+cam = json.load(open("truth/camera.json"))["camera"]
+K = np.array([[cam["fx"], 0, cam["cx"]], [0, cam["fy"], cam["cy"]], [0, 0, 1]])
+row = next(r for r in csv.DictReader(open("truth/frames.csv")) if r["xyz"])
+xyz = np.load("truth/" + row["xyz"])                  # (height, width, 3)
+v, u = np.nonzero(np.isfinite(xyz[..., 0]))
+pick = np.random.default_rng(0).choice(len(u), 2000, replace=False)
+ok, rvec, tvec = cv2.solvePnP(xyz[v[pick], u[pick]].astype(float),
+                              np.stack([u[pick], v[pick]], 1).astype(float), K, np.array(cam["d"]))
+print((-cv2.Rodrigues(rvec)[0].T @ tvec).ravel(), row["cam_e"], row["cam_n"], row["cam_u"])
+```
+
+**Heights.** `--altitude` works as in the viewer: `auto` (default) shifts a flight that
+starts at rest so that it starts on the terrain, `ground` always does, `recorded` never,
+and a number adds that many metres. Everything written (images, truth, prior) uses the
+shifted heights; the copied input topics keep theirs. Frames closer than `--min-agl`
+(default 1 m) to the terrain are left out, so a vehicle standing on the ground sends none.
+
+It needs OpenGL 3.3 and a display for its (hidden) window; on a machine without one, run it
+under a virtual display (`xvfb-run -a build-release/ogccdb-bag-render ...`). What it cannot
+give: the light, weather and season of another day, moving things, or anything the store's
+imagery and elevation do not hold. `--help` lists all options.
